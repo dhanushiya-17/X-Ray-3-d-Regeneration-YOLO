@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Virtual environment
+bonevision/
+.venv/
+venv/
+
+# Model weights
+*.pt
+*.pth
+
+# Datasets
+data/
+datasets/
+*.zip
+
+# YOLO training outputs
+runs/
+wandb/
+
+# Environment / secrets
+.env
+.env.*
+.kaggle/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS files
+.DS_Store
+Thumbs.db
