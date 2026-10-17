@@ -79,3 +79,26 @@ only after reproducible evaluation.
 This is a research project, not a clinically validated diagnostic
 system. It must not be used as a substitute for professional medical
 assessment.
+
+## Baseline evaluation results
+
+The multiview template-retrieval baseline was evaluated on 15 held-out
+validation subjects, comparing eight synthetic DRR views against 70
+training candidates.
+
+| Metric | Result |
+|---|---:|
+| Mean subject-level mean surface distance | 4.72 mm |
+| Median subject-level mean distance | 5.40 mm |
+| Standard deviation | 1.71 mm |
+| Mean subject-level 95th-percentile distance | 14.72 mm |
+
+These are preliminary template shape-comparison results, not measurements
+of a newly reconstructed patient-specific femur. Coordinate-frame checks
+passed for all 101 subjects, but full mesh-to-landmark registration
+accuracy has not yet been established. The results do not establish
+clinical validity.
+
+Results are saved in
+`reconstruction/retrieval_baseline/multiview_validation_matches.csv` and
+`reconstruction/retrieval_baseline/multiview_validation_3d_metrics.csv`.
