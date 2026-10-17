@@ -1,0 +1,32 @@
+
+# Python virtual environments
+femur3d/
+.venv/
+venv/
+
+# Large source datasets and medical images
+HFValid_Collection_v3.zip
+data/raw/
+data/meshes/
+data/meshes_qc/
+
+# Generated synthetic X-ray images
+data/drr_dataset/
+drr/
+
+# Large reconstruction outputs
+reconstruction/
+
+# Python cache and temporary files
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.log
+*.tmp
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# OS files
+.DS_Store
+Thumbs.db
