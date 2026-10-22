@@ -1,5 +1,6 @@
 
 from pathlib import Path
+import argparse
 import csv
 
 import numpy as np
@@ -16,7 +17,7 @@ ANGLES = list(range(0, 360, 45))
 
 def load_projection(path):
     with Image.open(path) as image:
-        return np.asarray(image.convert("L"), dtype=np.float64) / 255.0
+        return np.asarray(image.convert("L"), dtype=np.float32) / 255.0
 
 
 def normalized_correlation(a, b):
@@ -31,52 +32,73 @@ def normalized_correlation(a, b):
 
 
 def main():
+    parser = argparse.ArgumentParser(
+        description="Evaluate multi-view synthetic-DRR template retrieval."
+    )
+    parser.add_argument(
+        "--split", choices=("validation", "test"), default="validation",
+        help="Subject-level query split; templates always come from training.",
+    )
+    args = parser.parse_args()
+
     with SPLIT_FILE.open(newline="") as f:
         rows = list(csv.DictReader(f))
 
     train_subjects = sorted(
         r["subject"] for r in rows if r["split"] == "train"
     )
-    val_subjects = sorted(
-        r["subject"] for r in rows if r["split"] == "validation"
+    query_subjects = sorted(
+        r["subject"] for r in rows if r["split"] == args.split
     )
 
-    if len(train_subjects) != 70 or len(val_subjects) != 15:
-        raise ValueError("Unexpected training or validation split size.")
+    expected_queries = {"validation": 15, "test": 16}[args.split]
+    if len(train_subjects) != 70 or len(query_subjects) != expected_queries:
+        raise ValueError(f"Unexpected training or {args.split} split size.")
 
-    # Cache the images so they are loaded only once.
-    images = {}
+    # Load candidates one angle at a time. This keeps peak memory near 75 MB
+    # and avoids rereading the same training images for every query subject.
+    scores = np.empty(
+        (len(query_subjects), len(train_subjects), len(ANGLES)),
+        dtype=np.float32,
+    )
+    for angle_index, angle in enumerate(ANGLES):
+        template_images = np.stack([
+            load_projection(
+                DRR_ROOT / template / f"view_{angle:03d}.png"
+            ).ravel()
+            for template in train_subjects
+        ])
+        template_images -= template_images.mean(axis=1, keepdims=True)
+        template_norms = np.linalg.norm(template_images, axis=1)
 
-    for subject in train_subjects + val_subjects:
-        for angle in ANGLES:
-            path = DRR_ROOT / subject / f"view_{angle:03d}.png"
-            images[(subject, angle)] = load_projection(path)
+        for query_index, query_subject in enumerate(query_subjects):
+            query_path = DRR_ROOT / query_subject / f"view_{angle:03d}.png"
+            query = load_projection(query_path).ravel()
+            if query.size != template_images.shape[1]:
+                raise ValueError(f"Image dimensions differ: {query_path}")
+            query -= query.mean()
+            query_norm = np.linalg.norm(query)
+            denominators = template_norms * query_norm
+            angle_scores = np.full(len(train_subjects), -np.inf, dtype=np.float32)
+            np.divide(
+                template_images @ query,
+                denominators,
+                out=angle_scores,
+                where=denominators > 0,
+            )
+            scores[query_index, :, angle_index] = angle_scores
 
     results = []
-
-    for query_subject in val_subjects:
-        scores = []
-
-        for template_subject in train_subjects:
-            angle_scores = []
-
-            for angle in ANGLES:
-                score = normalized_correlation(
-                    images[(query_subject, angle)],
-                    images[(template_subject, angle)],
-                )
-                angle_scores.append(score)
-
-            scores.append((
-                float(np.mean(angle_scores)),
-                template_subject,
-                angle_scores,
-            ))
-
-        scores.sort(key=lambda item: item[0], reverse=True)
-
-        best_score, best_template, per_angle = scores[0]
-        second_score, second_template, _ = scores[1]
+    for query_index, query_subject in enumerate(query_subjects):
+        scores_by_template = scores[query_index]
+        mean_scores = scores_by_template.mean(axis=1)
+        ranking = np.argsort(mean_scores)[::-1]
+        best_index, second_index = int(ranking[0]), int(ranking[1])
+        best_score = float(mean_scores[best_index])
+        second_score = float(mean_scores[second_index])
+        best_template = train_subjects[best_index]
+        second_template = train_subjects[second_index]
+        per_angle = scores_by_template[best_index].tolist()
 
         results.append({
             "query_subject": query_subject,
@@ -96,7 +118,8 @@ def main():
             f"runner-up={second_template} ({second_score:.4f})"
         )
 
-    output_path = OUTPUT_DIR / "multiview_validation_matches.csv"
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    output_path = OUTPUT_DIR / f"multiview_{args.split}_matches.csv"
 
     with output_path.open("w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=results[0].keys())
@@ -104,7 +127,7 @@ def main():
         writer.writerows(results)
 
     print("\nMulti-view retrieval completed.")
-    print("Validation subjects:", len(results))
+    print(f"{args.split.capitalize()} subjects:", len(results))
     print("Training candidates per subject:", len(train_subjects))
     print("Views combined per candidate:", len(ANGLES))
     print("Saved to:", output_path)

@@ -1,20 +1,18 @@
 
 from pathlib import Path
+import argparse
 import csv
 import numpy as np
 import vtk
+from vtk.util.numpy_support import vtk_to_numpy
 
 ROOT = Path(__file__).resolve().parents[1]
-MATCH_FILE = (
-    ROOT / "reconstruction" / "retrieval_baseline"
-    / "multiview_validation_matches.csv"
-)
 SPLIT_FILE = ROOT / "data" / "subject_split.csv"
 MESH_ROOT = ROOT / "data" / "meshes_qc"
 LANDMARK_ROOT = ROOT / "data" / "raw" / "Subjects"
 OUTPUT_DIR = ROOT / "reconstruction" / "retrieval_baseline"
 
-N_SAMPLES = 10000
+N_SAMPLES = 2000
 SEED = 42
 
 
@@ -80,41 +78,34 @@ def load_aligned_mesh(subject):
 
 def sample_surface(mesh, n, seed):
     rng = np.random.default_rng(seed)
-    triangles, areas = [], []
-
-    for i in range(mesh.GetNumberOfCells()):
-        cell = mesh.GetCell(i)
-        if cell.GetNumberOfPoints() != 3:
-            continue
-
-        a, b, c = [
-            np.array(mesh.GetPoint(cell.GetPointId(j)))
-            for j in range(3)
-        ]
-        area = 0.5 * np.linalg.norm(np.cross(b - a, c - a))
-
-        if area > 0:
-            triangles.append((a, b, c))
-            areas.append(area)
-
-    if not triangles:
+    points = vtk_to_numpy(mesh.GetPoints().GetData()).astype(np.float64, copy=False)
+    cells = vtk_to_numpy(mesh.GetPolys().GetData())
+    if cells.size == 0 or cells.size % 4:
         raise ValueError("No valid surface triangles")
+    cells = cells.reshape(-1, 4)
+    if not np.all(cells[:, 0] == 3):
+        raise ValueError("Expected a triangulated surface mesh")
 
-    probs = np.asarray(areas, dtype=float)
-    probs /= probs.sum()
-    selected = rng.choice(len(triangles), n, p=probs)
+    triangles = points[cells[:, 1:]]
+    edge_a = triangles[:, 1] - triangles[:, 0]
+    edge_b = triangles[:, 2] - triangles[:, 0]
+    areas = 0.5 * np.linalg.norm(np.cross(edge_a, edge_b), axis=1)
+    valid = areas > 0
+    triangles = triangles[valid]
+    areas = areas[valid]
+    if not len(areas):
+        raise ValueError("No non-degenerate surface triangles")
 
-    points = np.empty((n, 3))
-    for i, idx in enumerate(selected):
-        a, b, c = triangles[idx]
-        u, v = rng.random(2)
-
-        if u + v > 1:
-            u, v = 1 - u, 1 - v
-
-        points[i] = a + u * (b - a) + v * (c - a)
-
-    return points
+    selected = rng.choice(len(triangles), n, p=areas / areas.sum())
+    selected_triangles = triangles[selected]
+    uv = rng.random((n, 2))
+    reflect = uv.sum(axis=1) > 1
+    uv[reflect] = 1 - uv[reflect]
+    return (
+        selected_triangles[:, 0]
+        + uv[:, :1] * (selected_triangles[:, 1] - selected_triangles[:, 0])
+        + uv[:, 1:] * (selected_triangles[:, 2] - selected_triangles[:, 0])
+    )
 
 
 def distances_to_surface(points, mesh):
@@ -138,21 +129,33 @@ def distances_to_surface(points, mesh):
 
 
 def main():
+    parser = argparse.ArgumentParser(
+        description="Measure multi-view template reconstruction on held-out subjects."
+    )
+    parser.add_argument(
+        "--split", choices=("validation", "test"), default="validation",
+        help="Query split; selected templates must always be training subjects.",
+    )
+    args = parser.parse_args()
+
+    match_file = (
+        OUTPUT_DIR / f"multiview_{args.split}_matches.csv"
+    )
     with SPLIT_FILE.open(newline="") as f:
         splits = list(csv.DictReader(f))
 
-    validation = {
-        r["subject"] for r in splits if r["split"] == "validation"
+    queries = {
+        r["subject"] for r in splits if r["split"] == args.split
     }
     training = {
         r["subject"] for r in splits if r["split"] == "train"
     }
 
-    with MATCH_FILE.open(newline="") as f:
+    with match_file.open(newline="") as f:
         matches = list(csv.DictReader(f))
 
-    if len(matches) != len(validation):
-        raise ValueError("Expected exactly one match per validation subject")
+    if len(matches) != len(queries):
+        raise ValueError(f"Expected exactly one match per {args.split} subject")
 
     cache = {}
     results = []
@@ -161,7 +164,7 @@ def main():
         query = row["query_subject"]
         template = row["selected_template"]
 
-        if query not in validation:
+        if query not in queries:
             raise ValueError(f"Unexpected query subject: {query}")
         if template not in training:
             raise ValueError(f"Template is not in training split: {template}")
@@ -183,6 +186,7 @@ def main():
         result = {
             "query_subject": query,
             "selected_template": template,
+            "surface_samples_per_mesh": N_SAMPLES,
             "mean_surface_distance_mm": combined.mean(),
             "median_surface_distance_mm": np.median(combined),
             "p95_surface_distance_mm": np.percentile(combined, 95),
@@ -196,13 +200,13 @@ def main():
             f"P95={result['p95_surface_distance_mm']:.2f} mm"
         )
 
-    output = OUTPUT_DIR / "multiview_validation_3d_metrics.csv"
+    output = OUTPUT_DIR / f"multiview_{args.split}_3d_metrics.csv"
     with output.open("w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=results[0].keys())
         writer.writeheader()
         writer.writerows(results)
 
-    print("\nCompleted:", len(results), "validation subjects")
+    print(f"\nCompleted: {len(results)} {args.split} subjects")
     print("Saved:", output)
     print("These are template shape-comparison metrics, not clinical validation.")
 

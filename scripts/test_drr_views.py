@@ -1,114 +1,75 @@
-import torch
+"""Compare stored Pat001 DRRs with a fresh DiffDRR render without saving files."""
+
+from pathlib import Path
+
 import numpy as np
-import matplotlib.pyplot as plt
+import torch
+from PIL import Image
 
 from diffdrr.data import read
 from diffdrr.drr import DRR
 
 
-# ============================================================
-# 1. Load cropped femur CT
-# ============================================================
-
-ct_path = "data/raw/Subjects/Pat001/Pat001_femur_only.nrrd"
-
-subject = read(ct_path)
+ROOT = Path(__file__).resolve().parents[1]
+SUBJECT = "Pat001"
+ANGLES = range(0, 360, 45)
 
 
-# ============================================================
-# 2. Device
-# ============================================================
+def main():
+    ct_path = ROOT / "data" / "raw" / "Subjects" / SUBJECT / f"{SUBJECT}_femur_only.nrrd"
+    drr_dir = ROOT / "data" / "drr_dataset" / SUBJECT
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-device = torch.device(
-    "cuda" if torch.cuda.is_available() else "cpu"
-)
+    subject = read(ct_path, orientation="AP", center_volume=True)
+    renderer = DRR(
+        subject=subject,
+        sdd=1020.0,
+        height=512,
+        width=512,
+        delx=1.5,
+        dely=1.5,
+        renderer="siddon",
+        patch_size=64,
+    ).to(device)
 
-print("Using device:", device)
-
-
-# ============================================================
-# 3. Create DRR
-# ============================================================
-
-drr = DRR(
-    subject=subject,
-    sdd=1020.0,
-    height=512,
-    width=512,
-    delx=1.5,
-    dely=1.5,
-    renderer="siddon",
-).to(device)
-
-
-# ============================================================
-# 4. Test angles
-# ============================================================
-
-angles = [0, 45, 90]
-
-
-# ============================================================
-# 5. Generate views
-# ============================================================
-
-for angle in angles:
-
-    # Azimuth angle
-    alpha = np.deg2rad(angle)
-
-    rotations = torch.tensor(
-        [[alpha, 0.0, 0.0]],
-        dtype=torch.float32,
-        device=device
-    )
-
-    translations = torch.tensor(
-        [[0.0, 850.0, 0.0]],
-        dtype=torch.float32,
-        device=device
-    )
-
-    with torch.no_grad():
-
-        projection = drr(
-            rotations,
-            translations,
-            parameterization="euler_angles",
-            convention="ZXY",
-            degrees=False,
+    print(f"Device: {device}; patch size: 64")
+    print("angle, correlation, normalized MAE")
+    for angle in ANGLES:
+        rotations = torch.tensor(
+            [[np.deg2rad(angle), 0.0, 0.0]], dtype=torch.float32, device=device
+        )
+        translations = torch.tensor(
+            [[0.0, 850.0, 0.0]], dtype=torch.float32, device=device
         )
 
-    projection = projection[0, 0].detach().cpu().numpy()
+        with torch.no_grad():
+            rendered = renderer(
+                rotations,
+                translations,
+                parameterization="euler_angles",
+                convention="ZXY",
+                degrees=False,
+            )[0, 0].cpu().numpy()
 
-    # Normalize
-    projection = (
-        projection - projection.min()
-    ) / (
-        projection.max() - projection.min() + 1e-8
-    )
+        span = rendered.max() - rendered.min()
+        if span <= 0:
+            raise ValueError(f"Rendered view {angle} has no intensity range")
+        rendered = (rendered - rendered.min()) / span
 
-    # Save
-    output_path = f"drr/test_{angle:03d}.png"
+        image_path = drr_dir / f"view_{angle:03d}.png"
+        with Image.open(image_path) as image:
+            reference = np.asarray(image.convert("L"), dtype=np.float32) / 255.0
 
-    plt.figure(figsize=(6, 6))
+        if rendered.shape != reference.shape:
+            raise ValueError(f"Image dimensions differ at {image_path}")
+        correlation = np.corrcoef(rendered.ravel(), reference.ravel())[0, 1]
+        mae = np.mean(np.abs(rendered - reference))
+        print(f"{angle:03d}, {correlation:.5f}, {mae:.5f}")
+        if correlation < 0.999 or mae > 0.001:
+            raise ValueError(
+                f"Stored view {angle:03d} does not reproduce within tolerance"
+            )
 
-    plt.imshow(
-        projection,
-        cmap="gray"
-    )
 
-    plt.axis("off")
-
-    plt.tight_layout(pad=0)
-
-    plt.savefig(
-        output_path,
-        dpi=150,
-        bbox_inches="tight",
-        pad_inches=0
-    )
-
-    plt.close()
-
-    print(f"Saved: {output_path}")
+if __name__ == "__main__":
+    main()

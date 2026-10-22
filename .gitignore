@@ -14,11 +14,22 @@ __pycache__/
 # Large medical datasets and CT scans
 HFValid_Collection_v3.zip
 data/raw/
+data/external/
 data/meshes/
 data/meshes_qc/
 data/drr_dataset/
+data/drr_anatomical/
+data/mesh_registered/
+data/occupancy_highres/
+data/occupancy_targets/
 drr/
 reconstruction/
+reconstruction_output/
+
+# Generated shape-model artifacts and evaluation outputs
+models/*.npz
+models/*.csv
+models/*.png
 
 # Generated visualizations
 data/pat001_mask_overlay.png
