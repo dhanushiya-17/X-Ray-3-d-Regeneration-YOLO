@@ -10,7 +10,7 @@ import streamlit as st
 import plotly.graph_objects as go
 from PIL import Image
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
 import sys
 sys.path.insert(0, str(ROOT / "scripts"))
 from reconstruct_single_xray import MODEL_PATH, read_image, reconstruct, save_results
