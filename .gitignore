@@ -37,3 +37,9 @@ data/pat001_mask_overlay.png
 # OS files
 .DS_Store
 Thumbs.db
+
+# Generated training data for the multi-view network and external imports
+data/biplanar/
+data/biplanar_external/
+data/external_occupancy/
+models/*.pt

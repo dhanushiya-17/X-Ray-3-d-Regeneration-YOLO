@@ -105,6 +105,10 @@ Results are saved in
 `reconstruction/retrieval_baseline/multiview_validation_matches.csv` and
 `reconstruction/retrieval_baseline/multiview_validation_3d_metrics.csv`.
 
+## Retraining plan
+
+`docs/retraining-plan.md` explains why the PCA-on-occupancy SSM is limited and lays out the recommended retraining path: an SDF shape model (`scripts/build_ssm_sdf.py`), a grid-aligned biplanar DRR dataset (`scripts/build_biplanar_dataset.py`), a multi-view X-ray-to-3D network (`scripts/train_multiview_net.py`), and importing extra public femurs as training-only shapes (`scripts/import_external_femurs.py`). Install the dependencies with `pip install -r requirements-train.txt`.
+
 ## Single-X-ray application and training
 
 The one-image demonstration is `app.py`. It accepts a single AP-like femur PNG/JPEG/TIFF or DICOM, offers crop, contrast-polarity, and Otsu-threshold controls, fits the CT-trained voxel SSM to a normalized silhouette, and displays the resulting mesh in a rotatable shaded or wireframe 3D viewer. It exports an STL (open in 3D Slicer with **File → Add Data**), a silhouette comparison, and a JSON run report. The 2D comparison is an SSM line-integral silhouette, not a clinical DRR. The fit is a population-shape estimate from a thresholded contour; a one-view image cannot uniquely determine hidden depth or absolute scale.
