@@ -65,6 +65,23 @@ This step runs on the CPU and takes a few minutes. Adopting it in the app
 needs one change in the fitter: decode `occ = sigmoid(-sdf / 1.5mm)` instead
 of clamping occupancy. That change is not part of this PR.
 
+### Running stages A and B in one command
+
+`scripts/run_retraining.py` runs the side check, the SDF model, the biplanar
+dataset, a 2-epoch smoke test, training and evaluation in order. It stops at
+the first result that looks wrong: missing inputs, mixed left and right
+femurs, images that do not line up with their 3D targets, a loss that does
+not fall, or a validation Dice below 0.80 (the test split is then left
+untouched). Finished steps are skipped on a re-run, each step's output is
+saved in `logs/`, and the comparison with the current SSM is written to
+`models/retraining_report.md`.
+
+```bash
+python scripts/run_retraining.py                 # AP + lateral, 300 epochs, --downsample 2
+python scripts/run_retraining.py --also-ap       # also the single-view model
+python scripts/run_retraining.py --from train    # redo from a given step
+```
+
 ### Stage B: multi-view network (the main model)
 
 1. Build grid-aligned training pairs. The full CT is resampled into the same
