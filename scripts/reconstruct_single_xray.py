@@ -10,7 +10,6 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import struct
 import time
 from pathlib import Path
 
@@ -20,6 +19,8 @@ from scipy import ndimage as ndi
 from skimage.filters import threshold_otsu
 from skimage.measure import label, marching_cubes, regionprops
 from skimage.morphology import disk
+
+from slicer_export import FRAME_DESCRIPTION, LABELMAP_NAME, MESH_NAME, export_for_slicer, write_stl
 
 ROOT = Path(__file__).resolve().parents[1]
 MODEL_PATH = ROOT / "models" / "ssm_highres.npz"
@@ -252,18 +253,7 @@ def _fit_once(targets: np.ndarray, data, iterations: int, device_name: str | Non
     return occ_np, proj_np, soft_dice, loss, history, device.type, bounds, choice, pose_np
 
 def _write_binary_stl(path: Path, vertices: np.ndarray, faces: np.ndarray) -> None:
-    tri = vertices[faces].astype(np.float32)
-    normals = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
-    lengths = np.linalg.norm(normals, axis=1, keepdims=True)
-    normals /= np.maximum(lengths, 1e-12)
-    records = np.empty(len(faces), dtype=np.dtype([("normal", "<f4", (3,)), ("vertices", "<f4", (3, 3)), ("attr", "<u2")]))
-    records["normal"] = normals
-    records["vertices"] = tri
-    records["attr"] = 0
-    with path.open("wb") as f:
-        f.write(b"BoneVision single-view SSM estimate".ljust(80, b"\0"))
-        f.write(struct.pack("<I", len(faces)))
-        records.tofile(f)
+    write_stl(path, vertices, faces, "BoneVision single-view SSM estimate")
 
 
 def reconstruct(image: np.ndarray, model_path: Path = MODEL_PATH, iterations: int = 250, polarity: str = "auto", threshold_bias: float = 0.0, device: str | None = None, prior_weight: float = 0.02) -> dict:
@@ -306,14 +296,14 @@ def reconstruct(image: np.ndarray, model_path: Path = MODEL_PATH, iterations: in
         "grid_dimensions_mm": tuple(float(b-a) for a,b in zip(bounds[::2], bounds[1::2])),
         "grid_shape": grid_shape, "n_components": int(len(data["explained_variance"])),
         "n_training_subjects": int(len(data["train_subjects"])) if "train_subjects" in data else None,
-        "prior_weight": float(prior_weight),
+        "prior_weight": float(prior_weight), "bounds": tuple(float(b) for b in bounds),
         "fit_status": "completed" if len(history) else "failed",
     }
 
 
 def save_results(result: dict, output_dir: Path, input_image: np.ndarray) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
-    _write_binary_stl(output_dir / "femur_reconstruction.stl", result["vertices_mm"], result["faces"])
+    slicer = export_for_slicer(output_dir, result["vertices_mm"], result["faces"], result["occupancy"], result["bounds"])
     from PIL import ImageDraw
     target = result["target_projection"]
     pred = result["projection"]
@@ -341,11 +331,13 @@ def save_results(result: dict, output_dir: Path, input_image: np.ndarray) -> Non
         "fitted_pose_log_scale_shift": result["fitted_pose_log_scale_shift"],
         "shape_prior_weight": result["prior_weight"],
         "n_training_subjects": result["n_training_subjects"],
-        "coordinate_frame": "canonical SSM anatomical frame in millimetres; STL does not encode patient RAS/LPS orientation",
+        "coordinate_frame": FRAME_DESCRIPTION,
         "flipped_long_axis": result["flipped_long_axis"],
         "optimization_loss_history": result["history"],
         "input_image_shape_pixels": list(input_image.shape),
-        "output_mesh": "femur_reconstruction.stl",
+        "output_mesh": MESH_NAME,
+        "output_labelmap": LABELMAP_NAME,
+        "slicer": slicer,
         "warning": "Research estimate only. Single-view depth is underdetermined; projection agreement is not a measurement of patient-specific 3D accuracy. Input was segmented with threshold-based image processing.",
     }
     (output_dir / "reconstruction.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
@@ -371,7 +363,7 @@ def main():
         parser.error("--iterations must be at least 1")
     if not np.isfinite(args.prior_weight) or args.prior_weight < 0:
         parser.error("--prior-weight must be finite and nonnegative")
-    output_files = [args.output / name for name in ("femur_reconstruction.stl", "reconstruction.json", "projection_fit.png")]
+    output_files = [args.output / name for name in (MESH_NAME, LABELMAP_NAME, "reconstruction.json", "projection_fit.png")]
     collisions = [str(path) for path in output_files if path.exists()]
     if collisions and not args.force_overwrite:
         parser.error("Refusing to overwrite existing output(s): " + ", ".join(collisions) + ". Choose another --output or pass --force-overwrite.")
@@ -380,7 +372,9 @@ def main():
     result = reconstruct(image, args.model, args.iterations, args.polarity, bias, None if args.device == "auto" else args.device, args.prior_weight)
     save_results(result, args.output, image)
     print(json.dumps({k: result[k] for k in ("fit_status", "projection_dice", "elapsed_seconds", "device", "spacing_mm", "dimensions_mm")}, indent=2))
-    print(f"STL: {args.output / 'femur_reconstruction.stl'}")
+    print(f"STL: {args.output / MESH_NAME}")
+    print(f"Labelmap: {args.output / LABELMAP_NAME}")
+    print(f"Open in 3D Slicer: Slicer --python-script {ROOT / 'slicer' / 'BoneVisionLoader' / 'BoneVisionLoader.py'} {args.output}")
 
 
 if __name__ == "__main__":

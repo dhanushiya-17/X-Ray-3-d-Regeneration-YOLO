@@ -12,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 from reconstruct_single_xray import segment_single_bone, standardize_mask, _write_binary_stl
 from evaluate_single_view import metrics
+from slicer_export import display_transforms, export_for_slicer, slicer_bundle
 
 
 class ReconstructionCoreTests(unittest.TestCase):
@@ -47,6 +48,45 @@ class ReconstructionCoreTests(unittest.TestCase):
             content = path.read_bytes()
         self.assertEqual(struct.unpack("<I", content[80:84])[0], 1)
         self.assertEqual(len(content), 84 + 50)
+
+    def test_slicer_export_aligns_mesh_and_labelmap_in_ras(self):
+        import gzip
+        import zipfile
+        from skimage.measure import marching_cubes
+        bounds = (-470.0, 40.0, -60.0, 100.0, -70.0, 70.0)
+        occ = np.zeros((32, 12, 12), dtype=np.float32)
+        occ[4:28, 3:9, 2:10] = 1.0
+        spacing = tuple((bounds[2*i+1]-bounds[2*i])/(occ.shape[i]-1) for i in range(3))
+        verts, faces, _, _ = marching_cubes(occ, level=0.5, spacing=spacing)
+        verts = verts + np.asarray(bounds[::2])
+        with tempfile.TemporaryDirectory() as temp_dir:
+            out = Path(temp_dir)
+            info = export_for_slicer(out, verts, faces, occ, bounds)
+            stl = (out / info["mesh"]).read_bytes()
+            raw = (out / info["labelmap"]).read_bytes()
+            names = zipfile.ZipFile(__import__("io").BytesIO(slicer_bundle(out))).namelist()
+        self.assertIn(b"SPACE=RAS", stl[:80])
+        header, payload = raw.split(b"\n\n", 1)
+        fields = dict(line.split(": ", 1) for line in header.decode().splitlines()[1:] if ":=" not in line)
+        self.assertEqual(fields["space"], "right-anterior-superior")
+        self.assertEqual(fields["sizes"], "32 12 12")
+        label = np.frombuffer(gzip.decompress(payload), dtype=np.uint8).reshape(occ.shape, order="F")
+        np.testing.assert_array_equal(label, occ >= 0.5)
+        origin = np.asarray([float(v) for v in fields["space origin"].strip("()").split(",")])
+        idx = np.argwhere(label)
+        lo, hi = origin + idx.min(0) * spacing, origin + idx.max(0) * spacing
+        # The 0.5 isosurface sits half a voxel outside the labelled voxel centres.
+        np.testing.assert_allclose(verts.min(0), lo - np.asarray(spacing) / 2, atol=1e-3)
+        np.testing.assert_allclose(verts.max(0), hi + np.asarray(spacing) / 2, atol=1e-3)
+        self.assertIn("bonevision_femur/BoneVisionLoader.py", names)
+
+    def test_slicer_display_transforms_are_rotations_with_proximal_superior(self):
+        for name, matrix in display_transforms().items():
+            rot = np.asarray(matrix, dtype=float)[:3, :3]
+            np.testing.assert_allclose(rot @ rot.T, np.eye(3), atol=1e-12)
+            self.assertAlmostEqual(np.linalg.det(rot), 1.0)
+            if name != "canonical":
+                np.testing.assert_array_equal(rot @ [1, 0, 0], [0, 0, 1])
 
     def test_ssm_grid_spacing_is_positive_physical_mm(self):
         data = np.load(ROOT / "models" / "ssm_highres.npz")

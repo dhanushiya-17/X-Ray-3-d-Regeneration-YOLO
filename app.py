@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parent
 import sys
 sys.path.insert(0, str(ROOT / "scripts"))
 from reconstruct_single_xray import MODEL_PATH, read_image, reconstruct, save_results
+from slicer_export import MESH_NAME, slicer_bundle
 
 st.set_page_config(page_title="BoneVision | Single-view femur", page_icon="🦴", layout="wide")
 st.markdown("""
@@ -162,14 +163,18 @@ if result is not None:
     with tempfile.TemporaryDirectory() as td:
         out = Path(td)
         save_results(result, out, st.session_state.input_image)
-        mesh_bytes = (out / "femur_reconstruction.stl").read_bytes()
+        mesh_bytes = (out / MESH_NAME).read_bytes()
         report_bytes = (out / "reconstruction.json").read_bytes()
         projection_bytes = (out / "projection_fit.png").read_bytes()
-    d1, d2, d3 = st.columns(3)
-    d1.download_button("Download STL for 3D Slicer", mesh_bytes, "femur_reconstruction.stl", "model/stl", use_container_width=True)
+        bundle_bytes = slicer_bundle(out)
+    d0, d1, d2, d3 = st.columns(4)
+    d0.download_button("Download 3D Slicer bundle (.zip)", bundle_bytes, "bonevision_femur_slicer.zip", "application/zip", type="primary", use_container_width=True)
+    d1.download_button("Download STL only", mesh_bytes, MESH_NAME, "model/stl", use_container_width=True)
     d2.download_button("Download reconstruction report", report_bytes, "reconstruction.json", "application/json", use_container_width=True)
     d3.download_button("Download silhouette comparison", projection_bytes, "projection_fit.png", "image/png", use_container_width=True)
-    st.caption("In 3D Slicer: drag the downloaded STL into the window or use File → Add Data. STL coordinates are the SSM canonical anatomical frame in millimetres.")
+    st.caption("The Slicer bundle holds the surface (STL), a labelmap (NRRD), the report and a loader script. Unzip it and run "
+               "`Slicer --python-script bonevision_femur/BoneVisionLoader.py`, or drag the STL into Slicer (File → Add Data). "
+               "Coordinates are the SSM canonical frame in millimetres; the upright view is a display rotation, not a patient registration.")
 
 
 
