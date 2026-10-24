@@ -115,7 +115,24 @@ The command-line path creates the same three outputs without the web UI:
 ./femur3d/bin/python scripts/reconstruct_single_xray.py /path/to/femur_xray.png --output /path/to/new_output_folder --device cuda
 ```
 
-The command refuses to replace existing STL, JSON, or PNG outputs. Choose a new output folder, or pass `--force-overwrite` only when replacement is intended. In Slicer, use **File → Add Data** and select `femur_reconstruction.stl`; the STL is in the model's canonical millimetre frame and does not encode a patient-specific RAS/LPS orientation.
+The command refuses to replace existing STL, NRRD, JSON, or PNG outputs. Choose a new output folder, or pass `--force-overwrite` only when replacement is intended.
+
+### Viewing results in 3D Slicer
+
+Each run writes two Slicer-ready files next to the JSON report:
+
+- `femur_reconstruction.stl`: the estimated surface.
+- `femur_labelmap.nrrd`: the same estimate as a voxel labelmap (1 = femur), for slice views and editing in Segment Editor.
+
+Both are in the SSM canonical frame in millimetres (x from the femoral head towards the proximal end, y towards the greater trochanter, z = x × y). They are tagged as Slicer RAS so Slicer loads them unchanged and the mesh and labelmap overlap exactly; an untagged STL would be read as LPS and flipped. This frame is not a patient frame.
+
+The quickest way to open a result is the loader in `slicer/BoneVisionLoader/BoneVisionLoader.py`:
+
+```bash
+Slicer --python-script slicer/BoneVisionLoader/BoneVisionLoader.py /path/to/output_folder [upright_right_femur|upright_left_femur|canonical]
+```
+
+It loads the surface, converts the labelmap into a segmentation, stores the run report as a text node, and applies a display rotation that stands the femur upright (proximal = superior). The rotation is for viewing only and assumes the side you choose; it is not a registration to patient anatomy. To use it as a module, add `slicer/BoneVisionLoader` under **Edit → Application Settings → Modules → Additional module paths** and open **BoneVision → BoneVision Loader**. Without the loader, use **File → Add Data**, keep the STL coordinate system as RAS, and tick **LabelMap** for the NRRD. The web app offers the same files plus the loader as one **3D Slicer bundle** zip; running the unzipped `BoneVisionLoader.py` with no folder argument loads its own folder.
 
 The current SSM is built from the 70 training subjects in the saved 70/15/16 split. The prepared local working copy has the generated artifact at `models/ssm_highres.npz`. Model files and CT-derived data are excluded from Git, so a fresh clone must obtain and prepare the required data and build a compatible model before running inference. To start the local interface, install the optional UI dependencies and launch Streamlit:
 
