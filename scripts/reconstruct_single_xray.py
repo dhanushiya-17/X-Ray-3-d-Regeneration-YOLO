@@ -104,12 +104,14 @@ def segment_single_bone(image: np.ndarray, polarity: str = "auto", threshold_bia
     return mask.astype(bool), {"polarity": chosen, "otsu_threshold": otsu, "threshold_used": cut, "component_area_fraction": area, "component_score": score}
 
 
-def standardize_mask(mask: np.ndarray, output_shape: tuple[int, int], reference_mask: np.ndarray | None = None) -> np.ndarray:
+def standardize_mask(mask: np.ndarray, output_shape: tuple[int, int], reference_mask: np.ndarray | None = None, match_length: bool = False) -> np.ndarray:
     """Orient one isolated femur and place it in the SSM's canonical AP frame.
 
     Absolute scale and translation are absent from ordinary PNG/JPEG images,
     so length and center are normalized to the mean SSM projection. Relative
     silhouette proportions are preserved as much as the projection bounds allow.
+    With match_length the bone length alone sets the scale (bounded by the
+    canvas), so views of one femur share a scale and keep their widths.
     """
     coords = np.argwhere(mask)
     if len(coords) < 100:
@@ -141,7 +143,10 @@ def standardize_mask(mask: np.ndarray, output_shape: tuple[int, int], reference_
     else:
         ref_h, ref_w = out_h, out_w
         center_y, center_x = (out_h - 1) / 2, (out_w - 1) / 2
-    scale = min(ref_h / cropped.shape[0], ref_w / cropped.shape[1])
+    if match_length:
+        scale = min(ref_h / cropped.shape[0], out_w / cropped.shape[1])
+    else:
+        scale = min(ref_h / cropped.shape[0], ref_w / cropped.shape[1])
     new_h = max(1, min(out_h, int(round(cropped.shape[0] * scale))))
     new_w = max(1, min(out_w, int(round(cropped.shape[1] * scale))))
     resized = np.asarray(Image.fromarray(cropped.astype(np.uint8) * 255).resize((new_w, new_h), Image.Resampling.NEAREST)) > 0
