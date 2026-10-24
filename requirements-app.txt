@@ -1,12 +1,11 @@
-# Optional dependencies for the local BoneVision interface.
-streamlit>=1.38
-plotly>=5.24
+# BoneVision web app + single-image pipeline (python serve.py).
+# Install a CUDA build of PyTorch first if you want GPU fitting (see pytorch.org).
+fastapi>=0.110
+uvicorn>=0.29
+python-multipart>=0.0.9
 numpy>=1.26
 scipy>=1.12
 scikit-image>=0.23
 Pillow>=10.0
 pydicom>=2.4
 torch>=2.1
-matplotlib>=3.8
-scikit-learn>=1.4
-vtk>=9.3
