@@ -88,6 +88,7 @@ class ReconstructionCoreTests(unittest.TestCase):
             if name != "canonical":
                 np.testing.assert_array_equal(rot @ [1, 0, 0], [0, 0, 1])
 
+    @unittest.skipUnless((ROOT / "models" / "ssm_highres.npz").exists(), "trained SSM is not available")
     def test_ssm_grid_spacing_is_positive_physical_mm(self):
         data = np.load(ROOT / "models" / "ssm_highres.npz")
         dims = tuple(int(x) for x in data["grid_shape"])
