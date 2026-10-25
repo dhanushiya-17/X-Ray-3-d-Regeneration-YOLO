@@ -1,8 +1,18 @@
 """Held-out single-view SSM vs 1-view retrieval evaluation on synthetic silhouettes.
 
-This is an idealized calibrated-silhouette experiment: the input silhouette is
-projected directly from the held-out CT-derived occupancy target in the SSM
-anatomical frame. It does not test real-radiograph segmentation or domain shift.
+Two input modes:
+
+* ``ideal`` (default, the protocol behind the README numbers): the exact AP
+  silhouette projected from each held-out CT occupancy, already in the SSM
+  frame at its true size and position.
+* ``app``: the same silhouette passed through the app's own standardization
+  (rotation to the long axis, physical rescaling to the population-mean length,
+  re-centring) before fitting. This removes the true size/position that the
+  ideal mode leaks and is the closer proxy for an uncalibrated upload.
+
+Both modes fit all four orientation hypotheses and score the posed occupancy
+(the same geometry the exported mesh uses). Neither mode tests real-radiograph
+segmentation, detector geometry or clinical domain shift.
 """
 from __future__ import annotations
 import argparse
@@ -81,7 +91,8 @@ def plot_metrics(csv_path: Path) -> Path:
     ]
     fig, axes = plt.subplots(1, 2, figsize=(11, 4.5))
     for ax, values, title, ylabel in zip(axes, series, ("Surface distance", "Voxel overlap"), ("Mean symmetric surface distance (mm)", "Dice")):
-        ax.boxplot(values, labels=("SSM fit", "1-view template"), showfliers=False)
+        ax.boxplot(values, showfliers=False)
+        ax.set_xticks((1, 2), ("SSM fit", "1-view template"))
         for x, vals in enumerate(values, start=1):
             jitter = np.linspace(-0.08, 0.08, len(vals)) if len(vals) > 1 else np.zeros(1)
             ax.scatter(np.full(len(vals), x) + jitter, vals, s=18, alpha=0.75, color=("#2b7a9b", "#d18c40")[x-1])
@@ -105,9 +116,13 @@ def main():
     parser.add_argument("--output", type=Path, default=None, help="Result CSV path; defaults to a split-specific path")
     parser.add_argument("--force-overwrite", action="store_true", help="Allow replacement of an existing CSV or summary figure")
     parser.add_argument("--device", choices=("auto", "cuda", "cpu"), default="auto")
+    parser.add_argument("--input-mode", choices=("ideal", "app"), default="ideal", help="ideal: exact canonical silhouette; app: through the app's standardization")
     parser.add_argument("--plot-only", action="store_true", help="Generate the summary figure from an existing metrics CSV without rerunning the evaluation")
     args = parser.parse_args()
-    args.output = args.output or (OUT if args.split == "test" else OUT.with_name("single_view_validation_metrics.csv"))
+    default_name = OUT.name if args.split == "test" else "single_view_validation_metrics.csv"
+    if args.input_mode == "app":
+        default_name = default_name.replace(".csv", "_appmode.csv")
+    args.output = args.output or OUT.with_name(default_name)
     figure_path = args.output.with_name(args.output.stem + "_summary.png")
     if args.plot_only:
         if figure_path.exists() and not args.force_overwrite:
@@ -125,16 +140,12 @@ def main():
     if args.limit > 0:
         subjects = subjects[:args.limit]
     import sys
-    sys.path.insert(0, str(ROOT / "scripts"))
-    from reconstruct_single_xray import _fit_once, prepare_ssm_fit
-    model = np.load(MODEL)
-    prepared = prepare_ssm_fit(model, None if args.device == "auto" else args.device)
-    model_train = set(str(x) for x in model["train_subjects"])
-    if model_train != set(train):
+    sys.path.insert(0, str(ROOT))
+    from bonevision.pipeline import fit_hypotheses, hypothesis_targets, load_model, pose_volume, standardize_mask_with_transform
+    model = load_model(MODEL, None if args.device == "auto" else args.device)
+    if set(model.train_subjects) != set(train):
         raise ValueError("SSM training subjects do not exactly match the saved training split")
-    shape = tuple(int(x) for x in model["grid_shape"])
-    bounds = tuple(float(x) for x in model["bounds"])
-    spacing = tuple((bounds[2*i+1] - bounds[2*i]) / (shape[i] - 1) for i in range(3))
+    spacing = tuple(model.spacing)
     train_projections, train_volumes = [], []
     for subject in train:
         vol = np.load(OCC / f"{subject}.npy") > 0
@@ -146,17 +157,22 @@ def main():
         started = time.perf_counter()
         try:
             gt = np.load(OCC / f"{subject}.npy") > 0
-            # Idealized single calibrated AP silhouette in the same canonical frame.
-            target = gt.any(axis=2)
-            fit = _fit_once(np.stack((target, np.flip(target, axis=0))), model, args.iterations, None if args.device == "auto" else args.device, prepared=prepared, prior_weight=args.prior_weight)
-            pred = fit[0] > 0.5
+            silhouette = gt.any(axis=2)
+            if args.input_mode == "app":
+                target, _ = standardize_mask_with_transform(silhouette, model.grid_shape[:2], model.reference_mask, model.spacing[:2])
+            else:
+                target = silhouette
+            targets = hypothesis_targets(target)
+            fit = fit_hypotheses(model, targets, args.iterations, args.prior_weight)
+            choice = fit["choice"]
+            pred = pose_volume(model.decode(fit["params"]), fit["pose"]) > 0.5
             ssm_metrics = metrics(pred, gt, spacing, seed=1000+index)
-            ssm_proj_dice = silhouette_dice(fit[1] >= 0.5, target if fit[7] == 0 else np.flip(target, axis=0))
-            query_for_templates = target if fit[7] == 0 else np.flip(target, axis=0)
+            query_for_templates = targets[choice]
+            ssm_proj_dice = silhouette_dice(fit["projection"] >= 0.5, query_for_templates)
             scores = np.asarray([silhouette_dice(candidate, query_for_templates) for candidate in train_projections])
             selected = int(np.argmax(scores))
             retrieval_metrics = metrics(train_volumes[selected], gt, spacing, seed=2000+index)
-            row = {"subject": subject, "status": "ok", "error": "", "retrieval_template": train[selected], "runtime_ssm_seconds": time.perf_counter()-started, "projection_soft_dice_ssm": fit[2], "projection_dice_retrieval": float(scores[selected]), "iterations": args.iterations, "prior_weight": args.prior_weight}
+            row = {"subject": subject, "status": "ok", "error": "", "retrieval_template": train[selected], "runtime_ssm_seconds": time.perf_counter()-started, "projection_soft_dice_ssm": fit["soft_dice"][choice], "projection_dice_ssm": ssm_proj_dice, "projection_dice_retrieval": float(scores[selected]), "orientation": choice, "input_mode": args.input_mode, "iterations": args.iterations, "prior_weight": args.prior_weight}
             row.update({"ssm_"+k:v for k,v in ssm_metrics.items()})
             row.update({"retrieval_"+k:v for k,v in retrieval_metrics.items()})
         except Exception as exc:
@@ -180,7 +196,7 @@ def main():
         writer.writeheader()
         writer.writerows(rows)
     print(f"Saved {len(subjects)} {args.split} rows plus aggregate mean to {args.output}")
-    print("Limit: exact synthetic silhouette and canonical camera frame; not real X-ray or automatic segmentation accuracy.")
+    print(f"Input mode: {args.input_mode}. Limit: synthetic CT silhouettes, not real X-ray or automatic segmentation accuracy.")
     if successful:
         print(f"Summary figure: {plot_metrics(args.output)}")
     else:

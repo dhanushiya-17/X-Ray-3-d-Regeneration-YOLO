@@ -1,0 +1,10 @@
+# Additional dependencies for the CT / DRR / SSM research scripts in scripts/.
+-r requirements-app.txt
+scikit-learn>=1.4
+matplotlib>=3.8
+vtk>=9.3
+SimpleITK>=2.3
+diffdrr>=0.4
+pycpd>=2.0
+# Tests: httpx is needed by FastAPI's TestClient.
+httpx>=0.27
