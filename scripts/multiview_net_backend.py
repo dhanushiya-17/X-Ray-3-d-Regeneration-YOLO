@@ -129,6 +129,21 @@ def _dice(a, b):
     return float((2.0 * (a & b).sum() + 1.0) / (a.sum() + b.sum() + 1.0))
 
 
+def surface_from_occupancy(occupancy: np.ndarray):
+    """Keep the largest solid component of a grid occupancy and mesh its 0.5 level in millimetres.
+    Returns (cleaned occupancy, vertices_mm, faces)."""
+    solid = ndi.binary_fill_holes(occupancy >= 0.5)
+    labels, n = ndi.label(solid)
+    if n == 0:
+        raise ValueError("The network predicted an empty volume; check the segmentation masks and view labels")
+    if n > 1:
+        solid = labels == (np.argmax(np.bincount(labels.ravel())[1:]) + 1)
+    occupancy = np.where(solid, np.maximum(occupancy, 0.5), np.minimum(occupancy, 0.49)).astype(np.float32)
+    verts, faces, _, _ = marching_cubes(occupancy, level=0.5, spacing=grid_spacing())
+    verts = verts + np.asarray(BOUNDS[0::2], dtype=np.float32)[None, :]
+    return occupancy, verts.astype(np.float32), faces.astype(np.int32)
+
+
 class MultiViewNetBackend:
     """Learned AP (+ lateral) to 3D femur network; see module docstring."""
     name = "multiview-net"
@@ -230,16 +245,8 @@ class MultiViewNetBackend:
         occupancy = occupancy.clamp(0, 1).cpu().numpy()
         if torch_device.type == "cuda":
             torch.cuda.empty_cache()
-        solid = ndi.binary_fill_holes(occupancy >= 0.5)
-        labels, n = ndi.label(solid)
-        if n == 0:
-            raise ValueError("The network predicted an empty volume; check the segmentation masks and view labels")
-        if n > 1:
-            solid = labels == (np.argmax(np.bincount(labels.ravel())[1:]) + 1)
-        occupancy = np.where(solid, np.maximum(occupancy, 0.5), np.minimum(occupancy, 0.49)).astype(np.float32)
+        occupancy, verts, faces = surface_from_occupancy(occupancy)
         spacing = grid_spacing()
-        verts, faces, _, _ = marching_cubes(occupancy, level=0.5, spacing=spacing)
-        verts = verts + np.asarray(BOUNDS[0::2], dtype=np.float32)[None, :]
 
         view_results = []
         for p_i, p in enumerate(per_view):

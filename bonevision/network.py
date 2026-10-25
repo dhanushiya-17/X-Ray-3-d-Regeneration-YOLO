@@ -89,32 +89,104 @@ def status() -> dict:
             "lateral_supported": any(c["available"] and "lat" in c["views"] for c in checkpoints)}
 
 
+MAX_VIEWS_PER_KIND = 3
+
+
+def _view_input(v: dict) -> ViewInput:
+    return ViewInput(image=np.asarray(v["image"], dtype=np.float32), angle_deg=VIEW_ANGLES[v["kind"]],
+                     name=v.get("name") or VIEW_LABELS[v["kind"]], polarity=v.get("polarity", "auto"),
+                     threshold_bias=float(v.get("threshold_bias", 0.0)), mirror=v.get("mirror", "auto"))
+
+
+def _dice(a, b) -> float:
+    a, b = np.asarray(a) >= 0.5, np.asarray(b) >= 0.5
+    return float((2.0 * (a & b).sum() + 1.0) / (a.sum() + b.sum() + 1.0))
+
+
 def reconstruct_views(views: list[dict], device: str | None = None, progress=None, cancel=None) -> dict:
-    """views: [{"image", "kind" ("ap"/"lat"), "name", "polarity", "threshold_bias"}], images already cropped."""
-    stage = (lambda name: progress(0, 0, None, stage=name)) if progress else (lambda name: None)
-    if cancel is not None and cancel():
-        raise FitCancelled("Cancelled")
-    inputs = [ViewInput(image=np.asarray(v["image"], dtype=np.float32), angle_deg=VIEW_ANGLES[v["kind"]],
-                        name=v.get("name") or VIEW_LABELS[v["kind"]], polarity=v.get("polarity", "auto"),
-                        threshold_bias=float(v.get("threshold_bias", 0.0)), mirror=v.get("mirror", "auto"))
-              for v in views]
-    stage("network")
-    result = backend().reconstruct(inputs, device=device)
-    if cancel is not None and cancel():
-        raise FitCancelled("Cancelled")
+    """views: [{"image", "kind" ("ap"/"lat"), "name", "polarity", "threshold_bias"}], images already cropped.
+
+    The network takes one AP and at most one lateral view. With several of
+    either, it runs once for every AP x lateral pair and the occupancies are
+    averaged; each view is then scored against the combined estimate, and a
+    view that agrees clearly less than the others is flagged.
+    """
+    def stage(name, i=0, n=0):
+        if progress:
+            progress(i, n, None, stage=name)
+
+    def check_cancel():
+        if cancel is not None and cancel():
+            raise FitCancelled("Cancelled")
+
+    check_cancel()
+    for i, v in enumerate(views):
+        v.setdefault("key", f"{v['kind']}{1 + sum(w['kind'] == v['kind'] for w in views[:i])}")
+    aps = [v for v in views if v["kind"] == "ap"]
+    lats = [v for v in views if v["kind"] == "lat"]
+    ignored = []
+    if lats and not status()["lateral_supported"]:
+        ignored, lats = [v["name"] for v in lats], []
+    pairs = [(a, l) for a in aps for l in lats] or [(a, None) for a in aps]
+    runs = []
+    for i, (a, lat) in enumerate(pairs):
+        stage("network", i + 1, len(pairs))
+        runs.append(backend().reconstruct([_view_input(a)] + ([_view_input(lat)] if lat else []), device=device))
+        check_cancel()
     stage("surface")
-    for view, request in zip(result["views"], views):
-        view["kind"] = request["kind"]
-        view["input_image"] = np.asarray(request["image"], dtype=np.float32)
-    result["warnings"] = [{"level": "warn", "code": "network_check", "message": w} for w in result["warnings"]]
+
+    result = runs[0]
+    if len(runs) > 1:
+        from multiview_net_backend import surface_from_occupancy
+        mean_occ = np.mean([r["occupancy"] for r in runs], axis=0)
+        occ, verts, faces = surface_from_occupancy(mean_occ)
+        result = dict(runs[0], occupancy=occ, vertices_mm=verts, faces=faces,
+                      dimensions_mm=tuple(float(x) for x in np.ptp(verts, axis=0)),
+                      elapsed_seconds=float(sum(r["elapsed_seconds"] for r in runs)),
+                      hypotheses_tested=int(sum(r["hypotheses_tested"] for r in runs)))
+        result["run_agreement"] = [_dice(r["occupancy"], occ) for r in runs]
+
+    # One entry per used view, scored against the final (possibly combined) occupancy.
+    occ = result["occupancy"]
+    out_views = []
+    for v in aps + lats:
+        pair_index = next(i for i, (a, lat) in enumerate(pairs) if v is a or v is lat)
+        run_view = runs[pair_index]["views"][0 if v["kind"] == "ap" else 1]
+        proj = occ.max(axis=2) if v["kind"] == "ap" else occ.max(axis=1)
+        out_views.append(dict(run_view, projection=proj, soft_dice=_dice(proj, run_view["target_projection"]),
+                              kind=v["kind"], key=v["key"], name=v["name"],
+                              input_image=np.asarray(v["image"], dtype=np.float32)))
+    dices = [v["soft_dice"] for v in out_views]
+    result.update(views=out_views, n_views=len(out_views), projection_dice=float(np.mean(dices)),
+                  min_view_dice=float(np.min(dices)), n_network_runs=len(runs),
+                  ignored_views=ignored + [n for r in runs for n in r["ignored_views"]])
+
+    warnings = []
+    for w in dict.fromkeys(w for r in runs for w in r["warnings"]):
+        warnings.append({"level": "warn", "code": "network_check", "message": w})
+    if len(out_views) > 2:
+        median = float(np.median(dices))
+        for v in out_views:
+            if v["soft_dice"] < median - 0.05:
+                warnings.append({"level": "warn", "code": "view_disagrees",
+                                 "message": f"{v['name']} agrees clearly less with the combined estimate (Dice {v['soft_dice']:.2f} "
+                                            f"against a median of {median:.2f}). It may show a different femur, a different "
+                                            "angle, or a wrong mask; try removing it."})
     if result["ignored_views"]:
-        result["warnings"].append({"level": "info", "code": "view_ignored",
-                                   "message": "No AP + lateral checkpoint was found, so the lateral view was not used: "
-                                              + ", ".join(result["ignored_views"])})
-    result["warnings"].append({"level": "info", "code": "assumed_size",
-                               "message": "Femur length is set to the training mean, and the output is shown as a left femur."})
+        warnings.append({"level": "info", "code": "view_ignored",
+                         "message": "No AP + lateral checkpoint was found, so these views were not used: "
+                                    + ", ".join(result["ignored_views"])})
+    if len(runs) > 1:
+        warnings.append({"level": "info", "code": "combined",
+                         "message": f"Combined {len(runs)} network runs ({len(aps)} AP x {max(1, len(lats))} lateral). "
+                                    "Extra views of the same direction average out segmentation and placement noise; "
+                                    "they do not add new angles."})
+    warnings.append({"level": "info", "code": "assumed_size",
+                     "message": "Femur length is set to the training mean, and the output is shown as a left femur."})
+    result["warnings"] = warnings
     result["pipeline_version"] = __version__
-    result["method_label"] = result.pop("method")
+    label = result.pop("method")
+    result["method_label"] = label if len(runs) == 1 else f"{label}, mean of {len(runs)} runs"
     return result
 
 

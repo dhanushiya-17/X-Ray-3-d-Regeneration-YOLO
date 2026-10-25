@@ -33,7 +33,7 @@ from .pipeline import (
 )
 
 MAX_UPLOAD_BYTES = 80 * 1024 * 1024
-MAX_UPLOADS = 6
+MAX_UPLOADS = 8
 MAX_CASES = 6
 WEB_DIR = ROOT / "web"
 
@@ -134,7 +134,7 @@ def status():
             info["model_error"] = f"{type(exc).__name__}: {exc}"
     net = network.status()
     info["methods"] = {
-        "network": {"label": "Learned network", "views": "AP + optional lateral", **net},
+        "network": {"label": "Learned network", "views": "AP + optional lateral", "max_views_per_kind": network.MAX_VIEWS_PER_KIND, **net},
         "ssm": {"label": "Shape-model fit", "views": "one AP", "available": info["model_available"],
                 "problem": None if info["model_available"] else info.get("model_error") or f"No shape model at {path.name}"},
     }
@@ -228,7 +228,7 @@ class ViewRequest(BaseModel):
 class CaseRequest(BaseModel):
     method: str = "ssm"
     upload_id: str | None = None
-    views: list[ViewRequest] = Field(default_factory=list, max_length=2)
+    views: list[ViewRequest] = Field(default_factory=list, max_length=2 * network.MAX_VIEWS_PER_KIND)
     crop: dict = Field(default_factory=dict)
     polarity: str = "auto"
     threshold_bias: float = Field(0.0, ge=-0.25, le=0.25)
@@ -244,7 +244,8 @@ def _network_summary(case: dict, r: dict) -> dict:
     return _jsonable({
         "method": "network", "method_label": r["method_label"], "score": r["projection_dice"],
         "silhouette_soft_dice": r["projection_dice"], "min_view_dice": r["min_view_dice"],
-        "views": [{k: v[k] for k in ("kind", "view_type", "name", "soft_dice", "mirrored", "flipped_long_axis",
+        "n_network_runs": r.get("n_network_runs", 1), "run_agreement": r.get("run_agreement"),
+        "views": [{k: v[k] for k in ("kind", "key", "view_type", "name", "soft_dice", "mirrored", "flipped_long_axis",
                                      "orientation_match", "orientation_margin", "assumed_mm_per_pixel", "segmentation")}
                   | {"crop_box": inp["crop_box"], "image_shape": list(inp["image"].shape), "input": {k: inp["meta"].get(k) for k in ("source_name", "format", "shape")}}
                   for v, inp in zip(r["views"], case["views_input"])],
@@ -334,8 +335,9 @@ def _network_case(req: CaseRequest) -> dict:
     kinds = [v.kind for v in req.views]
     if any(k not in network.VIEW_ANGLES for k in kinds):
         raise HTTPException(422, "Each view must be 'ap' or 'lat'")
-    if kinds.count("ap") != 1 or kinds.count("lat") > 1:
-        raise HTTPException(422, "The network needs exactly one AP view and at most one lateral view")
+    n = network.MAX_VIEWS_PER_KIND
+    if not 1 <= kinds.count("ap") <= n or kinds.count("lat") > n:
+        raise HTTPException(422, f"The network needs 1 to {n} AP views and at most {n} lateral views")
     views = []
     for v in sorted(req.views, key=lambda v: v.kind != "ap"):   # AP first
         if v.polarity not in ("auto", "bright", "dark"):
@@ -345,7 +347,9 @@ def _network_case(req: CaseRequest) -> dict:
             image, box = apply_crop(up["image"], v.crop)
         except ValueError as exc:
             raise HTTPException(422, f"{network.VIEW_LABELS[v.kind]} view: {exc}") from exc
-        views.append({"image": image, "kind": v.kind, "name": f"{network.VIEW_LABELS[v.kind]} view",
+        number = sum(w["kind"] == v.kind for w in views) + 1
+        label = f"{network.VIEW_LABELS[v.kind]} view" + (f" {number}" if kinds.count(v.kind) > 1 else "")
+        views.append({"image": image, "kind": v.kind, "key": f"{v.kind}{number}", "name": label,
                       "polarity": v.polarity, "threshold_bias": v.threshold_bias, "crop_box": box, "meta": up["meta"]})
     ap = views[0]
     meta = dict(ap["meta"]) | {"views": [{"kind": v["kind"], "crop_box_rows_cols": list(v["crop_box"])}

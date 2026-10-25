@@ -229,7 +229,7 @@ def network_files(result: dict) -> dict:
         "view_fit.png": ("image/png", "Each view on the network grid: traced outline (red) against the estimate's silhouette (cyan)."),
     }
     for view in result["views"]:
-        files[f"input_overlay_{view['kind']}.png"] = ("image/png", f"Your {'AP' if view['kind'] == 'ap' else 'lateral'} X-ray with its mask and the estimate's outline mapped back.")
+        files[f"input_overlay_{view['key']}.png"] = ("image/png", f"{view['name']}: your X-ray with its mask and the estimate's outline mapped back.")
     return files
 
 
@@ -252,6 +252,7 @@ def network_report(result: dict, input_meta: dict | None) -> dict:
             "meaning": "2D overlap between each traced outline and the estimate's silhouette on the network grid. Not 3D accuracy.",
         },
         "orientation_hypotheses_tested": result["hypotheses_tested"],
+        "network_runs": result.get("n_network_runs", 1), "run_agreement_3d_dice": result.get("run_agreement"),
         "views": [{k: v for k, v in view.items() if k not in VIEW_ARRAYS} for view in result["views"]],
         "ignored_views": result["ignored_views"],
         "mesh": {"vertices": int(len(result["vertices_mm"])), "faces": int(len(result["faces"])),
@@ -297,7 +298,7 @@ def build_network_file(name: str, result: dict, input_meta: dict | None = None) 
     if name == "view_fit.png":
         return view_fit_png(result)
     for view in result["views"]:
-        if name == f"input_overlay_{view['kind']}.png":
+        if name == f"input_overlay_{view['key']}.png":
             return png_bytes(overlay_view(view, view["input_image"]))
     raise KeyError(name)
 

@@ -66,6 +66,16 @@ def synthetic_xray(mirror=True, angle=10.0):
     return (img * 0.75 + 0.12 + np.random.default_rng(0).normal(0, 0.02, img.shape)).clip(0, 1).astype(np.float32)
 
 
+def lateral_xray(angle=-5.0):
+    """Lateral (sum along y) radiograph of the same procedural femur as synthetic_xray."""
+    from make_demo_model import femur_like
+    occ = femur_like((256, 96, 96), np.random.default_rng(99))
+    img = 1 - np.exp(-occ.sum(axis=1) * (160 / 95) / 40)
+    img = ndi.zoom(img, (2.0, 1.474), order=1)
+    img = np.pad(ndi.rotate(img, angle, reshape=True, order=1), 30)
+    return (img * 0.75 + 0.12 + np.random.default_rng(1).normal(0, 0.02, img.shape)).clip(0, 1).astype(np.float32)
+
+
 class SegmentationAndStandardization(unittest.TestCase):
     def test_synthetic_bright_bone_segmentation_and_canonical_mask(self):
         image = np.zeros((512, 256), dtype=np.float32)
@@ -316,14 +326,14 @@ class NetworkApi(unittest.TestCase):
 
     def test_ap_and_lateral_case_produces_slicer_files(self):
         ap = self._upload(synthetic_xray(mirror=True, angle=10.0))
-        lat = self._upload(synthetic_xray(mirror=False, angle=-5.0))
+        lat = self._upload(lateral_xray())
         cid, r = self._run([{"upload_id": lat, "kind": "lat"}, {"upload_id": ap, "kind": "ap"}])
         self.assertEqual(r["model_views"], ["ap", "lat"])
         self.assertEqual([v["kind"] for v in r["views"]], ["ap", "lat"])
         self.assertTrue(r["views"][0]["mirrored"])
         names = {f["name"] for f in r["files"]}
         self.assertTrue({"femur_reconstruction.stl", "femur_labelmap.nrrd", "reconstruction.json",
-                         "input_overlay_ap.png", "input_overlay_lat.png"} <= names)
+                         "input_overlay_ap1.png", "input_overlay_lat1.png"} <= names)
         stl = self.c.get(f"/api/cases/{cid}/files/femur_reconstruction.stl").content
         self.assertIn(b"SPACE=RAS", stl[:80])
         report = self.c.get(f"/api/cases/{cid}/files/reconstruction.json").json()
@@ -338,10 +348,26 @@ class NetworkApi(unittest.TestCase):
         _, r = self._run([{"upload_id": self._upload(synthetic_xray()), "kind": "ap"}])
         self.assertEqual(r["model_views"], ["ap"])
 
+    def test_several_views_are_combined_and_an_odd_one_is_flagged(self):
+        aps = [self._upload(synthetic_xray(mirror=True, angle=a)) for a in (10.0, -4.0)]
+        lat = self._upload(lateral_xray())
+        odd = self._upload(lateral_xray())                    # a lateral image mislabelled as AP
+        views = [{"upload_id": u, "kind": "ap"} for u in aps] + [{"upload_id": lat, "kind": "lat"}, {"upload_id": odd, "kind": "ap"}]
+        cid, r = self._run(views)
+        self.assertEqual(r["n_network_runs"], 3)
+        self.assertEqual([v["key"] for v in r["views"]], ["ap1", "ap2", "ap3", "lat1"])
+        self.assertEqual(len(r["run_agreement"]), 3)
+        names = {f["name"] for f in r["files"]}
+        self.assertTrue({"input_overlay_ap1.png", "input_overlay_ap3.png", "input_overlay_lat1.png"} <= names)
+        self.assertTrue(any(w["code"] == "combined" for w in r["warnings"]))
+        flagged = [w["message"] for w in r["warnings"] if w["code"] == "view_disagrees"]
+        self.assertEqual(len(flagged), 1)
+        self.assertTrue(flagged[0].startswith("AP view 3"))
+
     def test_view_rules_are_enforced(self):
         lat = self._upload(synthetic_xray())
         for views in ([{"upload_id": lat, "kind": "lat"}], [{"upload_id": lat, "kind": "oblique"}],
-                      [{"upload_id": lat, "kind": "ap"}, {"upload_id": lat, "kind": "ap"}]):
+                      [{"upload_id": lat, "kind": "ap"}] * 4):
             self.assertEqual(self.c.post("/api/cases", json={"method": "network", "views": views}).status_code, 422)
 
 
