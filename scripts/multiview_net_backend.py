@@ -79,7 +79,7 @@ def _principal_frame(points: np.ndarray):
 
 
 def place_on_grid(image: np.ndarray, mask: np.ndarray, ref: dict, kind: str, s_rows: float, s_cols: float,
-                  flip: bool, mirror: bool):
+                  flip: bool, mirror: bool, return_affine: bool = False):
     """Resample an X-ray and its femur mask onto the network's grid for one orientation hypothesis.
 
     The femur's principal axis is matched to the principal axis of the mean
@@ -87,7 +87,8 @@ def place_on_grid(image: np.ndarray, mask: np.ndarray, ref: dict, kind: str, s_r
     kept). Its proximal end goes where the mean femur's proximal end is (the
     grid's origin is the femoral head), its length is scaled to the mean
     training femur, and across the shaft the centroids are matched.
-    Returns (grid_image, grid_mask, mm_per_pixel).
+    Returns (grid_image, grid_mask, mm_per_pixel), plus with return_affine the
+    map (M, t) from grid (row, col) to image (row, col): p = M @ q + t.
     """
     ref_mask = ref[kind]
     ref_pts = np.argwhere(ref_mask) * np.array([s_rows, s_cols])
@@ -115,13 +116,32 @@ def place_on_grid(image: np.ndarray, mask: np.ndarray, ref: dict, kind: str, s_r
     background = float(np.percentile(image, 1))
     grid_image = ndi.map_coordinates(image.astype(np.float32), coords, order=1, mode="constant", cval=background)
     grid_mask = ndi.map_coordinates(mask.astype(np.float32), coords, order=0, mode="constant", cval=0.0) > 0.5
-    return grid_image, grid_mask, mm_per_px
+    if not return_affine:
+        return grid_image, grid_mask, mm_per_px
+    t = coords[:, 0, 0]
+    M = np.stack([coords[:, 1, 0] - t, coords[:, 0, 1] - t], axis=1)   # the map is affine, so two steps fix it
+    return grid_image, grid_mask, mm_per_px, (M, t)
 
 
 def _dice(a, b):
     """Dice of two silhouettes; probabilities are thresholded at 0.5."""
     a, b = np.asarray(a) >= 0.5, np.asarray(b) >= 0.5
     return float((2.0 * (a & b).sum() + 1.0) / (a.sum() + b.sum() + 1.0))
+
+
+def surface_from_occupancy(occupancy: np.ndarray):
+    """Keep the largest solid component of a grid occupancy and mesh its 0.5 level in millimetres.
+    Returns (cleaned occupancy, vertices_mm, faces)."""
+    solid = ndi.binary_fill_holes(occupancy >= 0.5)
+    labels, n = ndi.label(solid)
+    if n == 0:
+        raise ValueError("The network predicted an empty volume; check the segmentation masks and view labels")
+    if n > 1:
+        solid = labels == (np.argmax(np.bincount(labels.ravel())[1:]) + 1)
+    occupancy = np.where(solid, np.maximum(occupancy, 0.5), np.minimum(occupancy, 0.49)).astype(np.float32)
+    verts, faces, _, _ = marching_cubes(occupancy, level=0.5, spacing=grid_spacing())
+    verts = verts + np.asarray(BOUNDS[0::2], dtype=np.float32)[None, :]
+    return occupancy, verts.astype(np.float32), faces.astype(np.int32)
 
 
 class MultiViewNetBackend:
@@ -207,9 +227,10 @@ class MultiViewNetBackend:
             mirrors = {"auto": (False, True), "no": (False,), "yes": (True,)}[view.mirror]
             hyps = []
             for flip, mirror in itertools.product((False, True), mirrors):
-                g_img, g_mask, mm_px = place_on_grid(bright, mask, ref, kind, sx, col_spacing[kind], flip, mirror)
+                g_img, g_mask, mm_px, affine = place_on_grid(bright, mask, ref, kind, sx, col_spacing[kind], flip, mirror,
+                                                             return_affine=True)
                 hyps.append({"flip": flip, "mirror": mirror, "grid_image": g_img, "grid_mask": g_mask,
-                             "mm_per_pixel": mm_px, "reference_dice": _dice(g_mask, ref[kind])})
+                             "mm_per_pixel": mm_px, "grid_to_image": affine, "reference_dice": _dice(g_mask, ref[kind])})
             hyps.sort(key=lambda h: -h["reference_dice"])
             scores += [h["reference_dice"] for h in hyps]
             per_view.append({"view": view, "kind": kind, "mask": mask, "seg": seg, "hyps": hyps, "chosen": hyps[0]})
@@ -224,16 +245,8 @@ class MultiViewNetBackend:
         occupancy = occupancy.clamp(0, 1).cpu().numpy()
         if torch_device.type == "cuda":
             torch.cuda.empty_cache()
-        solid = ndi.binary_fill_holes(occupancy >= 0.5)
-        labels, n = ndi.label(solid)
-        if n == 0:
-            raise ValueError("The network predicted an empty volume; check the segmentation masks and view labels")
-        if n > 1:
-            solid = labels == (np.argmax(np.bincount(labels.ravel())[1:]) + 1)
-        occupancy = np.where(solid, np.maximum(occupancy, 0.5), np.minimum(occupancy, 0.49)).astype(np.float32)
+        occupancy, verts, faces = surface_from_occupancy(occupancy)
         spacing = grid_spacing()
-        verts, faces, _, _ = marching_cubes(occupancy, level=0.5, spacing=spacing)
-        verts = verts + np.asarray(BOUNDS[0::2], dtype=np.float32)[None, :]
 
         view_results = []
         for p_i, p in enumerate(per_view):
@@ -246,7 +259,7 @@ class MultiViewNetBackend:
                 "soft_dice": _dice(proj, target), "mirrored": bool(h["mirror"]), "flipped_long_axis": bool(h["flip"]),
                 "orientation_match": round(h["reference_dice"], 4),
                 "orientation_margin": round(h["reference_dice"] - (p["hyps"][1]["reference_dice"] if len(p["hyps"]) > 1 else 0.0), 4),
-                "assumed_mm_per_pixel": round(h["mm_per_pixel"], 4),
+                "assumed_mm_per_pixel": round(h["mm_per_pixel"], 4), "grid_to_image": h["grid_to_image"],
                 "input_image_shape_pixels": list(np.asarray(p["view"].image).shape),
             })
         ignored = [v.name for v, k in zip(views, kinds) if k not in model_views]
@@ -298,7 +311,8 @@ class MultiViewNetBackend:
             "grid_shape": result["grid_shape"], "spacing_mm": result["spacing_mm"],
             "dimensions_mm": result["dimensions_mm"], "canonical_side": result["canonical_side"],
             "ignored_views": result["ignored_views"], "warnings": result["warnings"],
-            "views": [{k: v for k, v in view.items() if k not in ("mask", "target_projection", "projection")} for view in result["views"]],
+            "views": [{k: v for k, v in view.items() if k not in ("mask", "target_projection", "projection", "grid_to_image")}
+                      for view in result["views"]],
             "coordinate_frame": FRAME_DESCRIPTION, "output_mesh": MESH_NAME, "output_labelmap": LABELMAP_NAME,
             "slicer": slicer,
             "warning": "Research estimate only, not validated for clinical use. The network was trained on simulated "

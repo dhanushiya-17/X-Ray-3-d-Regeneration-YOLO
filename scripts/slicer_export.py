@@ -30,7 +30,7 @@ FRAME_DESCRIPTION = (
 )
 
 
-def write_stl(path: Path, vertices: np.ndarray, faces: np.ndarray, title: str = "BoneVision femur estimate") -> None:
+def stl_bytes(vertices: np.ndarray, faces: np.ndarray, title: str = "BoneVision femur estimate") -> bytes:
     """Binary STL whose header carries Slicer's ``SPACE=RAS`` tag."""
     tri = np.asarray(vertices, dtype=np.float32)[np.asarray(faces)]
     normals = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
@@ -41,13 +41,14 @@ def write_stl(path: Path, vertices: np.ndarray, faces: np.ndarray, title: str = 
     records["vertices"] = tri
     records["attr"] = 0
     header = f"{title} SPACE=RAS".encode("ascii", "replace")[:80]
-    with Path(path).open("wb") as f:
-        f.write(header.ljust(80, b"\0"))
-        f.write(struct.pack("<I", len(tri)))
-        records.tofile(f)
+    return header.ljust(80, b"\0") + struct.pack("<I", len(tri)) + records.tobytes()
 
 
-def write_nrrd(path: Path, volume: np.ndarray, spacing, origin, extra: dict | None = None) -> None:
+def write_stl(path: Path, vertices: np.ndarray, faces: np.ndarray, title: str = "BoneVision femur estimate") -> None:
+    Path(path).write_bytes(stl_bytes(vertices, faces, title))
+
+
+def nrrd_bytes(volume: np.ndarray, spacing, origin, extra: dict | None = None) -> bytes:
     """Gzip NRRD in RAS space; ``volume[i, j, k]`` is the sample at ``origin + (i, j, k) * spacing``."""
     volume = np.asarray(volume)
     if volume.ndim != 3:
@@ -72,9 +73,18 @@ def write_nrrd(path: Path, volume: np.ndarray, spacing, origin, extra: dict | No
         lines.append(f"{key}:={value}")
     # NRRD stores the first axis fastest, which is numpy's Fortran order.
     payload = gzip.compress(volume.astype(volume.dtype.newbyteorder("<"), copy=False).tobytes(order="F"))
-    with Path(path).open("wb") as f:
-        f.write(("\n".join(lines) + "\n\n").encode("ascii"))
-        f.write(payload)
+    return ("\n".join(lines) + "\n\n").encode("ascii") + payload
+
+
+def write_nrrd(path: Path, volume: np.ndarray, spacing, origin, extra: dict | None = None) -> None:
+    Path(path).write_bytes(nrrd_bytes(volume, spacing, origin, extra))
+
+
+def labelmap_bytes(occupancy: np.ndarray, bounds, threshold: float = 0.5) -> bytes:
+    """The thresholded occupancy as a uint8 labelmap NRRD on the SSM grid (1 = femur)."""
+    spacing, origin = grid_geometry(bounds, occupancy.shape)
+    labelmap = (np.asarray(occupancy) >= threshold).astype(np.uint8)
+    return nrrd_bytes(labelmap, spacing, origin, {"BoneVision_label_1": "femur estimate"})
 
 
 def grid_geometry(bounds, grid_shape) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
@@ -103,9 +113,12 @@ def export_for_slicer(output_dir: Path, vertices_mm: np.ndarray, faces: np.ndarr
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     write_stl(output_dir / MESH_NAME, vertices_mm, faces)
-    spacing, origin = grid_geometry(bounds, occupancy.shape)
-    labelmap = (np.asarray(occupancy) >= threshold).astype(np.uint8)
-    write_nrrd(output_dir / LABELMAP_NAME, labelmap, spacing, origin, {"BoneVision_label_1": "femur estimate"})
+    (output_dir / LABELMAP_NAME).write_bytes(labelmap_bytes(occupancy, bounds, threshold))
+    return slicer_info(threshold)
+
+
+def slicer_info(threshold: float = 0.5) -> dict:
+    """The ``slicer`` section of a run report for files named MESH_NAME and LABELMAP_NAME."""
     return {
         "mesh": MESH_NAME,
         "labelmap": LABELMAP_NAME,

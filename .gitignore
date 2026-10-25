@@ -24,10 +24,17 @@ data/occupancy_highres/
 data/occupancy_targets/
 drr/
 reconstruction/
+# Small, published baseline summaries are kept in Git deliberately:
+!reconstruction/
+reconstruction/*
+!reconstruction/retrieval_baseline/
+reconstruction/retrieval_baseline/*
+!reconstruction/retrieval_baseline/multiview_validation_*.csv
 reconstruction_output/
 
 # Generated shape-model artifacts and evaluation outputs
 models/*.npz
+# includes the synthetic demo model (rebuild with scripts/make_demo_model.py)
 models/*.csv
 models/*.png
 
@@ -49,3 +56,4 @@ models/*.pt
 logs/
 data/femur_sides.csv
 models/*.md
+models/demo/
