@@ -14,7 +14,7 @@ import sys
 sys.path.insert(0, str(ROOT / "scripts"))
 from reconstruct_single_xray import read_image
 from reconstruct_multiview_xray import ViewInput
-from reconstruction_backends import get_backend
+from reconstruction_backends import available_backends, default_backend_name, get_backend
 from slicer_export import MESH_NAME, slicer_bundle
 
 st.set_page_config(page_title="BoneVision | X-ray to 3D femur", page_icon="🦴", layout="wide")
@@ -26,16 +26,16 @@ st.markdown("""
 """, unsafe_allow_html=True)
 st.title("BoneVision")
 st.caption("X-ray views of one femur → 3D femur estimate")
-st.warning("Research demonstration, not validated for clinical use. The output is a shape-prior estimate fitted to bone silhouettes; view angles are declared by you, not calibrated, and absolute size comes from the shape model. Projection match is not proof of 3D accuracy.")
+st.warning("Research demonstration, not validated for clinical use. The output is a 3D estimate learned from CT-derived training data; view angles are declared by you, not calibrated, and absolute size comes from the training population. The models have been evaluated on simulated X-rays only. Projection match is not proof of 3D accuracy.")
 
 VIEW_CHOICES = {"AP (0°)": 0.0, "Lateral (90°)": 90.0, "Other angle": None}
 MIRROR_CHOICES = {"Auto (try both)": "auto", "As uploaded": "no", "Mirrored": "yes"}
 
 
 @st.cache_resource(show_spinner=False)
-def load_backend():
-    # Kept across reruns so the SSM and its per-angle projections load once.
-    return get_backend()
+def load_backend(name: str):
+    # Kept across reruns so each model and its precomputed data load once.
+    return get_backend(name)
 
 
 def decode_upload(name: str, data: bytes) -> np.ndarray:
@@ -64,11 +64,10 @@ def render_view_fit(v: dict, src: np.ndarray, cinput, cproj) -> None:
         rgb[...,1] = (tgt & pred) * 220
         rgb[...,2] = (~tgt & pred) * 255
         st.image(rgb, use_container_width=True)
-        st.caption(f"{v['angle_deg']:.0f}° silhouette · red = input only · green = overlap · blue = fitted SSM only. Not a full radiographic DRR.")
+        st.caption(f"{v['angle_deg']:.0f}° silhouette · red = input only · green = overlap · blue = 3D estimate only. Not a full radiographic DRR.")
 
 
-backend = load_backend()
-backend_problem = backend.availability()
+backend_names = available_backends()
 
 if "result" not in st.session_state:
     st.session_state.result = None
@@ -77,13 +76,21 @@ if "input_images" not in st.session_state:
 
 with st.sidebar:
     st.header("Inputs")
+    backend_name = st.selectbox("Model", backend_names, index=backend_names.index(default_backend_name()),
+                                format_func=lambda n: load_backend(n).label,
+                                help="Every registered reconstruction backend. A retrained model appears here once its files exist.")
+    backend = load_backend(backend_name)
+    backend_problem = backend.availability()
     uploads = st.file_uploader(
         "Upload X-rays of the same femur", type=["png", "jpg", "jpeg", "tif", "tiff", "dcm", "dicom"], accept_multiple_files=True,
         help=f"One AP view works; adding a lateral view constrains depth. Up to {backend.max_views} views.",
     )
-    iterations = st.slider("Shape-fit iterations", 50, 400, 250, 25, help="Fast fit of every orientation hypothesis using projected shape modes.")
-    refine_iterations = st.slider("3D solid refinement iterations", 0, 300, 100, 25, help="Refines the chosen fit so the exported mesh itself matches the silhouettes. Slower on CPU; 0 skips it.")
-    st.caption(f"**Model:** {backend.label}")
+    if backend.name == "ssm-silhouette":
+        iterations = st.slider("Shape-fit iterations", 50, 400, 250, 25, help="Fast fit of every orientation hypothesis using projected shape modes.")
+        refine_iterations = st.slider("3D solid refinement iterations", 0, 300, 100, 25, help="Refines the chosen fit so the exported mesh itself matches the silhouettes. Slower on CPU; 0 skips it.")
+    else:
+        iterations, refine_iterations = 250, 100
+        st.caption("The network takes one AP view and optionally one lateral view.")
     st.caption("Crop each view to a single femur and avoid implants if possible. DICOM pixel values are rescaled when metadata is present; physical scale is assumed from the SSM prior.")
 
 uploads = list(uploads or [])
@@ -157,8 +164,11 @@ if views:
         try:
             with st.status(f"Reconstructing from {len(views)} view(s)…", expanded=True) as status:
                 st.write("Extracting one bone-like component from each image")
-                st.write("Fitting one CT-trained 3D shape to every silhouette at its declared angle")
-                st.write("Refining the decoded 3D solid against each silhouette")
+                if backend.name == "ssm-silhouette":
+                    st.write("Fitting one CT-trained 3D shape to every silhouette at its declared angle")
+                    st.write("Refining the decoded 3D solid against each silhouette")
+                else:
+                    st.write("Placing each view on the network's grid and testing its orientations")
                 result = backend.reconstruct(views, iterations=iterations, refine_iterations=refine_iterations)
                 st.write("Extracting a millimetre-scale surface mesh")
                 status.update(label="Reconstruction completed", state="complete", expanded=False)
@@ -178,13 +188,13 @@ if result is not None:
         view_style = st.radio("Surface view", ["Shaded", "Wireframe"], horizontal=True)
         fig = go.Figure()
         if view_style == "Shaded":
-            fig.add_trace(go.Mesh3d(x=verts[:,0], y=verts[:,1], z=verts[:,2], i=faces[:,0], j=faces[:,1], k=faces[:,2], color="#d8c4a6", opacity=1.0, flatshading=False, lighting=dict(ambient=0.45, diffuse=0.75, specular=0.25, roughness=0.55), lightposition=dict(x=100, y=150, z=250), name="SSM estimate"))
+            fig.add_trace(go.Mesh3d(x=verts[:,0], y=verts[:,1], z=verts[:,2], i=faces[:,0], j=faces[:,1], k=faces[:,2], color="#d8c4a6", opacity=1.0, flatshading=False, lighting=dict(ambient=0.45, diffuse=0.75, specular=0.25, roughness=0.55), lightposition=dict(x=100, y=150, z=250), name="3D estimate"))
         else:
             edges = np.unique(np.sort(np.concatenate((faces[:,[0,1]], faces[:,[1,2]], faces[:,[2,0]]), axis=0), axis=1), axis=0)
             if len(edges) > 12000:
                 edges = edges[np.linspace(0, len(edges)-1, 12000, dtype=int)]
             wire = np.concatenate((verts[edges], np.full((len(edges),1,3), np.nan, dtype=np.float32)), axis=1).reshape(-1,3)
-            fig.add_trace(go.Scatter3d(x=wire[:,0], y=wire[:,1], z=wire[:,2], mode="lines", line=dict(color="#66788a", width=1), name="SSM wireframe"))
+            fig.add_trace(go.Scatter3d(x=wire[:,0], y=wire[:,1], z=wire[:,2], mode="lines", line=dict(color="#66788a", width=1), name="3D wireframe"))
         fig.update_layout(height=660, margin=dict(l=0,r=0,t=15,b=0), scene=dict(aspectmode="data", xaxis_title="Anatomical X (mm)", yaxis_title="Anatomical Y (mm)", zaxis_title="Anatomical Z (mm)"), showlegend=False)
         st.plotly_chart(fig, use_container_width=True, config={"displaylogo":False, "scrollZoom":True})
     with cstat:
@@ -195,10 +205,16 @@ if result is not None:
         m1.metric("Runtime", f"{result['elapsed_seconds']:.1f} s")
         m2.metric("Compute", result["device"].upper())
         st.write(f"**Method:** {result['method']}")
-        st.write(f"**Modes:** {result['n_components']} · **Training shapes:** {result['n_training_subjects']}")
-        st.write(f"**Shape-prior weight:** {result['prior_weight']:.3f}")
-        st.write(f"**Orientation hypotheses tested:** {result['hypotheses_tested']} (long axis flipped: {'yes' if result['flipped_long_axis'] else 'no'})")
-        st.write(f"**3D solid refinement:** {result['refine_iterations']} iterations")
+        for warning in result.get("warnings", []):
+            st.warning(warning)
+        if "details" in result:
+            for line in result["details"]:
+                st.write(line)
+        else:
+            st.write(f"**Modes:** {result['n_components']} · **Training shapes:** {result['n_training_subjects']}")
+            st.write(f"**Shape-prior weight:** {result['prior_weight']:.3f}")
+            st.write(f"**Orientation hypotheses tested:** {result['hypotheses_tested']} (long axis flipped: {'yes' if result['flipped_long_axis'] else 'no'})")
+            st.write(f"**3D solid refinement:** {result['refine_iterations']} iterations")
         st.write(f"**Voxel spacing:** {', '.join(f'{x:.2f}' for x in result['spacing_mm'])} mm")
         st.write("**Mesh dimensions (mm):** " + str(tuple(round(x,1) for x in result["dimensions_mm"])))
         st.line_chart(result["history"], height=150, use_container_width=True)
@@ -209,7 +225,7 @@ if result is not None:
     st.dataframe([{
         "view": v["name"], "beam angle (°)": v["angle_deg"], "silhouette Dice": round(v["soft_dice"], 3),
         "mirrored": v["mirrored"], "contrast": v["segmentation"]["polarity"],
-        "pose (log scale, dy, dx)": tuple(round(x, 3) for x in v["fitted_pose_log_scale_shift"]),
+        "pose (log scale, dy, dx)": tuple(round(x, 3) for x in v["fitted_pose_log_scale_shift"]) if "fitted_pose_log_scale_shift" in v else "",
     } for v in result["views"]], use_container_width=True, hide_index=True)
     pairs = list(zip(result["views"], st.session_state.input_images))
     for row in range(0, len(pairs), 2):

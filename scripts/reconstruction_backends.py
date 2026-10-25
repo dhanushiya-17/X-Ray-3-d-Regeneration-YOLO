@@ -11,8 +11,10 @@ radiographs of one femur and returns a result dict with at least:
     elapsed_seconds, device, method, fit_status, history.
 
 `save(result, output_dir)` writes the Slicer-ready STL/NRRD, the JSON report
-and the silhouette comparison. Register a new backend with `register_backend`
-and select it with the BONEVISION_BACKEND environment variable.
+and the silhouette comparison. A backend may also return `details`, a list
+of short lines the app shows under the fit status. Register a new backend
+with `register_backend`; the app lists every registered backend, and the
+BONEVISION_BACKEND environment variable sets the default.
 """
 from __future__ import annotations
 
@@ -20,6 +22,7 @@ import os
 from pathlib import Path
 from typing import Callable, Protocol
 
+from multiview_net_backend import MultiViewNetBackend
 from reconstruct_multiview_xray import (
     MAX_VIEWS, MODEL_PATH, ViewInput, load_model, reconstruct_multiview, save_multiview_results,
 )
@@ -75,7 +78,11 @@ class SSMSilhouetteBackend:
         save_multiview_results(result, Path(output_dir), self.name)
 
 
-_BACKENDS: dict[str, Callable[[], ReconstructionBackend]] = {SSMSilhouetteBackend.name: SSMSilhouetteBackend}
+# Listed in order of preference: the first one whose model files exist is the default.
+_BACKENDS: dict[str, Callable[[], ReconstructionBackend]] = {
+    MultiViewNetBackend.name: MultiViewNetBackend,
+    SSMSilhouetteBackend.name: SSMSilhouetteBackend,
+}
 
 
 def register_backend(name: str, factory: Callable[[], ReconstructionBackend]) -> None:
@@ -86,8 +93,18 @@ def available_backends() -> list[str]:
     return list(_BACKENDS)
 
 
+def default_backend_name() -> str:
+    """BONEVISION_BACKEND if set, else the first registered backend that is ready to use."""
+    if os.environ.get("BONEVISION_BACKEND"):
+        return os.environ["BONEVISION_BACKEND"]
+    for name in _BACKENDS:
+        if _BACKENDS[name]().availability() is None:
+            return name
+    return SSMSilhouetteBackend.name
+
+
 def get_backend(name: str | None = None) -> ReconstructionBackend:
-    name = name or os.environ.get("BONEVISION_BACKEND", SSMSilhouetteBackend.name)
+    name = name or default_backend_name()
     if name not in _BACKENDS:
         raise KeyError(f"Unknown reconstruction backend {name!r}; registered: {', '.join(_BACKENDS)}")
     return _BACKENDS[name]()

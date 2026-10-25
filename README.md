@@ -135,7 +135,14 @@ The same path is available without the UI:
 
 It writes the same Slicer-ready STL/NRRD, report, and a side-by-side silhouette comparison for every view. `--refine-iterations 0` skips stage 2. Stage 2 decodes the full voxel grid on every step, so it is fast on a CUDA GPU and takes around a minute on a laptop CPU.
 
-The web app talks to the model only through `scripts/reconstruction_backends.py`. A backend takes the list of views and returns a mesh, occupancy grid, and per-view diagnostics. The current one is `ssm-silhouette`; set `BONEVISION_MODEL` to point it at a different `.npz`. To try a retrained model (a new SSM or a learned network), implement the same `availability` / `reconstruct` / `save` methods, call `register_backend`, and start the app with `BONEVISION_BACKEND=<name>`. The UI does not change.
+The web app talks to the model only through `scripts/reconstruction_backends.py`, and the sidebar's **Model** menu lists every registered backend. The default is the first one whose files exist (override with `BONEVISION_BACKEND=<name>`):
+
+| Backend | Files it needs | Views |
+|---|---|---|
+| `multiview-net` | `models/multiview_ap_lat_d2.pt` (and `models/multiview_ap_d2.pt` for AP-only uploads), plus `models/ssm_sdf.npz` for checkpoints trained before the reference silhouettes were stored in them | one AP, optionally one lateral |
+| `ssm-silhouette` | `models/ssm_highres.npz` (`BONEVISION_MODEL` overrides) | up to 6 at any declared angle |
+
+The network checkpoints come from `scripts/run_retraining.py` (see `docs/retraining-plan.md`). `BONEVISION_NET_AP_LAT` and `BONEVISION_NET_AP` point the backend at other checkpoint files, so a retrained network replaces the current one without code changes. The backend segments each upload, puts the femur on the network's grid (principal axis matched to the mean training silhouette, proximal end at the femoral head, length scaled to the mean training femur), picks the orientation that best matches the mean silhouette, and warns when that choice or the silhouette fit is weak. The mesh is always a left femur at the training-mean length. On synthetic DRRs resampled to square pixels, rotated, flipped and mirrored, it gave 3D Dice 0.77–0.92 against the true femur (0.80–0.92 after correcting length); it has not been tested on real radiographs. To add a different kind of model, implement `availability` / `reconstruct` / `save`, and register it with `register_backend`; the UI does not change.
 
 Limits specific to multiple views: angles are what you declare, not measured, so a mislabelled view pulls the shape the wrong way, and a low Dice on one view is the first thing to check. Absolute size still comes from the prior, because each view's scale is normalized. The views must show the same femur, without the patient moving between exposures in ways other than the declared rotation. Multi-view fitting has been checked on synthetic shapes in `tests/test_multiview_reconstruction.py`, where adding a lateral view recovers a depth mode that AP alone cannot. It has not yet been evaluated on the held-out HFValid subjects or on real radiographs.
 
