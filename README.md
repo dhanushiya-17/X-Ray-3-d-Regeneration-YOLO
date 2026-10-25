@@ -7,6 +7,8 @@ BoneVision is a research prototype that estimates a 3D femur surface from an **A
 
 > **Research estimate, not a measurement.** Neither method has been validated on real clinical radiographs, and the network was trained only on simulated X-rays. Size comes from the training population, not from your image. Silhouette agreement is 2D overlap, not 3D accuracy. Do not use it for diagnosis, treatment or surgical planning.
 
+> **Picking up the project?** Start with [`docs/HANDOFF.md`](docs/HANDOFF.md) (state, how to run, roadmap) or its compressed form [`docs/HANDOFF_COMPACT.md`](docs/HANDOFF_COMPACT.md).
+
 ## Quick start
 
 ```bash
