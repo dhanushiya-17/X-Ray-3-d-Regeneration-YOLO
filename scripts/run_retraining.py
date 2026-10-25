@@ -32,7 +32,7 @@ import time
 
 import numpy as np
 
-from femur_grid import ROOT, CANONICAL_SIDE, OCC_DIR, LANDMARK_ROOT, load_split
+from femur_grid import ROOT, CANONICAL_SIDE, OCC_DIR, LANDMARK_ROOT, grid_spacing, load_split
 
 SCRIPTS = ROOT / "scripts"
 MODEL_DIR = ROOT / "models"
@@ -145,27 +145,32 @@ def _corr(a, b):
     return float((a * b).sum() / max(np.sqrt((a * a).sum() * (b * b).sum()), 1e-12))
 
 
-def alignment_margin(sample, shift=8):
+def view_margins(sample):
     """How much better each view lines up with its target than with shifted copies of it.
 
-    Both the image and the projected target silhouette are high-pass filtered,
+    The image and the projected target silhouette are high-pass filtered,
     which removes the smooth soft-tissue background and keeps the bone edges,
-    then correlated. A matching pair correlates best unshifted; a misaligned
-    pair does no better than a shifted silhouette. Returns the smaller margin
-    of the two views (aligned correlation minus the best shifted one; > 0
-    means the target is where the image says the femur is).
+    then correlated. A matching pair correlates best unshifted. The shifts are
+    16 mm across the shaft and 60 mm along it: the shaft looks the same after a
+    short shift along its length, so only a long one tests the head and knee.
+    Returns {"ap": margin, "lat": margin}, each the aligned correlation minus
+    the best shifted one (> 0 means the target is where the image shows the femur).
     """
     d = np.load(sample)
-    margins = []
-    for img, mask in ((d["ap"], d["occ"].any(axis=2)), (d["lat"], d["occ"].any(axis=1))):
+    sx, sy, sz = grid_spacing(d["occ"].shape)
+    out = {}
+    for name, mask, s_across in (("ap", d["occ"].any(axis=2), sy), ("lat", d["occ"].any(axis=1), sz)):
+        img = d[name]
         if not np.isfinite(img).all() or img.max() <= 0 or not mask.any():
-            return -1.0
+            out[name] = -1.0
+            continue
+        across, along = int(round(16.0 / s_across)), int(round(60.0 / sx))
         hp = _highpass(img)
         aligned = _corr(hp, _highpass(mask))
         shifted = max(_corr(hp, _highpass(np.roll(mask, k, axis=ax)))
-                      for ax in (0, 1) for k in (-shift, shift))
-        margins.append(aligned - shifted)
-    return min(margins)
+                      for ax, n in ((0, along), (1, across)) for k in (-n, n))
+        out[name] = round(aligned - shifted, 4)
+    return out
 
 
 def step_dataset(opts):
@@ -180,7 +185,16 @@ def step_dataset(opts):
         if per_split[name] < 0.9 * len(n):
             raise StepFailed("Only {}/{} {} samples were built. Errors: data/biplanar/dataset_report.csv".format(
                 per_split[name], len(n), name))
-    scores = {s: alignment_margin(p) for s, p in have.items()}
+    per_view = {s: view_margins(p) for s, p in have.items()}
+    with (MODEL_DIR / "alignment.csv").open("w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["subject", "ap_margin", "lat_margin"])
+        for subj, m in sorted(per_view.items()):
+            writer.writerow([subj, m["ap"], m["lat"]])
+    for view in ("ap", "lat"):
+        v = np.array([m[view] for m in per_view.values()])
+        print("  {:3s} margin: median {:.3f}, below 0: {}".format(view, float(np.median(v)), int((v <= 0).sum())))
+    scores = {subj: min(m.values()) for subj, m in per_view.items()}
     ranked = sorted((v, s) for s, v in scores.items())
     bad = [s for v, s in ranked if v <= 0.0]
     median = float(np.median(list(scores.values())))
@@ -189,8 +203,9 @@ def step_dataset(opts):
     if bad:
         print("Weakly aligned samples:", ", ".join(bad))
     if len(bad) > 0.1 * len(scores):
-        raise StepFailed("{} samples line up with their 3D target no better than with a shifted copy of it, "
-                         "so the images and targets do not match. Check the landmark frame.".format(len(bad)))
+        raise StepFailed("{} samples line up with their 3D target no better than with a shifted copy of it. "
+                         "Per-view numbers: models/alignment.csv. To look at them: "
+                         "python scripts/plot_alignment.py".format(len(bad)))
     return "{} samples, alignment median {:.2f}{}".format(
         len(have), median, ", weak: " + " ".join(bad) if bad else "")
 
