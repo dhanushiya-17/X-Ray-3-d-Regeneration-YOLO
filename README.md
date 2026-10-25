@@ -119,7 +119,42 @@ The command-line path creates the same three outputs without the web UI:
 ./femur3d/bin/python scripts/reconstruct_single_xray.py /path/to/femur_xray.png --output /path/to/new_output_folder --device cuda
 ```
 
-The command refuses to replace existing STL, JSON, or PNG outputs. Choose a new output folder, or pass `--force-overwrite` only when replacement is intended. In Slicer, use **File → Add Data** and select `femur_reconstruction.stl`; the STL is in the model's canonical millimetre frame and does not encode a patient-specific RAS/LPS orientation.
+The command refuses to replace existing STL, NRRD, JSON, or PNG outputs. Choose a new output folder, or pass `--force-overwrite` only when replacement is intended.
+
+### Multi-view input and the reconstruction backend
+
+`app.py` now accepts one or more X-rays of the same femur (up to six). Label each image with its beam rotation about the femur's long axis: **AP (0°)**, **Lateral (90°)**, or any other angle. One SSM shape is fitted to every silhouette at once, so a lateral or oblique view constrains the depth that a single AP view leaves to the population prior. A single uploaded image still works and runs the same pipeline with one view.
+
+The fit runs in two stages. Stage 1 fits every orientation hypothesis (long axis up or down, and each image as uploaded or mirrored) using precomputed projections of the PCA modes, then keeps the best one. Stage 2 refines that fit against the silhouette of the decoded 3D solid (the ray maximum of sharpened occupancy around the 0.5 mesh level). Without it, a silhouette can match while the exported mesh is thinner than the bone, because line integrals of partly occupied voxels still look opaque. All views are normalized to a common bone length and share one 2D scale, with per-view shifts. Per-view silhouette Dice, the chosen orientation, and the fitted coefficients are in the app and in `reconstruction.json`.
+
+The same path is available without the UI:
+
+```bash
+./femur3d/bin/python scripts/reconstruct_multiview_xray.py ap.png:AP lateral.png:lateral oblique.dcm:45 --output /path/to/new_output_folder --device cuda
+```
+
+It writes the same Slicer-ready STL/NRRD, report, and a side-by-side silhouette comparison for every view. `--refine-iterations 0` skips stage 2. Stage 2 decodes the full voxel grid on every step, so it is fast on a CUDA GPU and takes around a minute on a laptop CPU.
+
+The web app talks to the model only through `scripts/reconstruction_backends.py`. A backend takes the list of views and returns a mesh, occupancy grid, and per-view diagnostics. The current one is `ssm-silhouette`; set `BONEVISION_MODEL` to point it at a different `.npz`. To try a retrained model (a new SSM or a learned network), implement the same `availability` / `reconstruct` / `save` methods, call `register_backend`, and start the app with `BONEVISION_BACKEND=<name>`. The UI does not change.
+
+Limits specific to multiple views: angles are what you declare, not measured, so a mislabelled view pulls the shape the wrong way, and a low Dice on one view is the first thing to check. Absolute size still comes from the prior, because each view's scale is normalized. The views must show the same femur, without the patient moving between exposures in ways other than the declared rotation. Multi-view fitting has been checked on synthetic shapes in `tests/test_multiview_reconstruction.py`, where adding a lateral view recovers a depth mode that AP alone cannot. It has not yet been evaluated on the held-out HFValid subjects or on real radiographs.
+
+### Viewing results in 3D Slicer
+
+Each run writes two Slicer-ready files next to the JSON report:
+
+- `femur_reconstruction.stl`: the estimated surface.
+- `femur_labelmap.nrrd`: the same estimate as a voxel labelmap (1 = femur), for slice views and editing in Segment Editor.
+
+Both are in the SSM canonical frame in millimetres (x from the femoral head towards the proximal end, y towards the greater trochanter, z = x × y). They are tagged as Slicer RAS so Slicer loads them unchanged and the mesh and labelmap overlap exactly; an untagged STL would be read as LPS and flipped. This frame is not a patient frame.
+
+The quickest way to open a result is the loader in `slicer/BoneVisionLoader/BoneVisionLoader.py`:
+
+```bash
+Slicer --python-script slicer/BoneVisionLoader/BoneVisionLoader.py /path/to/output_folder [upright_right_femur|upright_left_femur|canonical]
+```
+
+It loads the surface, converts the labelmap into a segmentation, stores the run report as a text node, and applies a display rotation that stands the femur upright (proximal = superior). The rotation is for viewing only and assumes the side you choose; it is not a registration to patient anatomy. To use it as a module, add `slicer/BoneVisionLoader` under **Edit → Application Settings → Modules → Additional module paths** and open **BoneVision → BoneVision Loader**. Without the loader, use **File → Add Data**, keep the STL coordinate system as RAS, and tick **LabelMap** for the NRRD. The web app offers the same files plus the loader as one **3D Slicer bundle** zip; running the unzipped `BoneVisionLoader.py` with no folder argument loads its own folder.
 
 The current SSM is built from the 70 training subjects in the saved 70/15/16 split. The prepared local working copy has the generated artifact at `models/ssm_highres.npz`. Model files and CT-derived data are excluded from Git, so a fresh clone must obtain and prepare the required data and build a compatible model before running inference. To start the local interface, install the optional UI dependencies and launch Streamlit:
 
