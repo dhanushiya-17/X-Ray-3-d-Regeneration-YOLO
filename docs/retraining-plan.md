@@ -15,7 +15,7 @@ so no new accuracy numbers are claimed here.
 | Otsu thresholding on real radiographs | same | Overlapping pelvis, soft tissue and the other leg break the mask, and every later step inherits the error. |
 | Mesh SSM correspondence is broken | `build_mesh_ssm.py` (CPD) | The audit measured about 12 mm mean error on a training subject, so the mesh SSM cannot be used yet. |
 | 70 training shapes | split | This is small for PCA with 60 modes, and very small for a neural network. |
-| Possible side mixing | landmark frame | The frame uses `z = x × y`. If HFValid contains both left and right femurs, anterior and posterior swap between sides, and the model averages mirror-image shapes. **Check this first**, for example by plotting the anterior-bow direction for each subject, and mirror one side if needed. |
+| Side mixing (confirmed) | landmark frame | The frame uses `z = x × y`, so left and right femurs are mirror images in it. HFValid has 64 left and 37 right femurs (landmark side and anterior-bow direction agree), so the earlier models averaged mirror-image shapes. The new scripts mirror right femurs onto the left (`femur_grid.CANONICAL_SIDE`, `load_occupancy`, `read_landmark_frame`), and `run_retraining.py` stops if mirroring does not make the bow direction consistent. A right-leg X-ray must be mirrored before inference and the output mirrored back. |
 
 The most important finding is that the method family is the limit, not the
 training run. Retraining the same PCA-on-occupancy model with the same data
@@ -64,6 +64,23 @@ python scripts/build_ssm_sdf.py                # writes models/ssm_sdf.npz + mod
 This step runs on the CPU and takes a few minutes. Adopting it in the app
 needs one change in the fitter: decode `occ = sigmoid(-sdf / 1.5mm)` instead
 of clamping occupancy. That change is not part of this PR.
+
+### Running stages A and B in one command
+
+`scripts/run_retraining.py` runs the side check, the SDF model, the biplanar
+dataset, a 2-epoch smoke test, training and evaluation in order. It stops at
+the first result that looks wrong: missing inputs, mixed left and right
+femurs, images that do not line up with their 3D targets, a loss that does
+not fall, or a validation Dice below 0.80 (the test split is then left
+untouched). Finished steps are skipped on a re-run, each step's output is
+saved in `logs/`, and the comparison with the current SSM is written to
+`models/retraining_report.md`.
+
+```bash
+python scripts/run_retraining.py                 # AP + lateral, 300 epochs, --downsample 2
+python scripts/run_retraining.py --also-ap       # also the single-view model
+python scripts/run_retraining.py --from train    # redo from a given step
+```
 
 ### Stage B: multi-view network (the main model)
 

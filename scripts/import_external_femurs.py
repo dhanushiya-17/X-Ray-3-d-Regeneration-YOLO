@@ -44,7 +44,7 @@ import numpy as np
 from scipy.spatial import cKDTree
 from skimage.measure import marching_cubes
 
-from femur_grid import ROOT, BOUNDS, DIMENSIONS, OCC_DIR, SPLIT_FILE, grid_spacing, load_split
+from femur_grid import ROOT, BOUNDS, DIMENSIONS, OCC_DIR, SPLIT_FILE, grid_spacing, load_occupancy, load_split
 
 OUTPUT_DIR = ROOT / "data" / "external_occupancy"
 
@@ -56,7 +56,7 @@ def reference_points(n=6000):
     train = load_split(SPLIT_FILE)["train"]
     mean = None
     for s in train:
-        occ = np.load(OCC_DIR / (s + ".npy")).astype(np.float32)
+        occ = load_occupancy(s, OCC_DIR).astype(np.float32)
         mean = occ if mean is None else mean + occ
     mean /= len(train)
     verts, _, _, _ = marching_cubes(mean, 0.5, spacing=grid_spacing())

@@ -27,7 +27,8 @@ from pathlib import Path
 import numpy as np
 from sklearn.decomposition import PCA
 
-from femur_grid import ROOT, OCC_DIR, SPLIT_FILE, grid_spacing, load_split, occupancy_to_sdf
+from femur_grid import (ROOT, CANONICAL_SIDE, OCC_DIR, SPLIT_FILE, grid_spacing, load_occupancy,
+                        load_split, occupancy_to_sdf)
 
 MODEL_DIR = ROOT / "models"
 MODEL_FILE = MODEL_DIR / "ssm_sdf.npz"
@@ -70,12 +71,13 @@ def main():
     if not train:
         raise ValueError("No training subjects in split file")
 
-    first = np.load(occ_dir / (train[0] + ".npy"))
+    # HFValid targets are mirrored onto CANONICAL_SIDE; extra shapes are already aligned.
+    first = load_occupancy(train[0], occ_dir)
     shape = first.shape
     spacing = grid_spacing(shape)
     print("Grid", shape, "spacing", tuple(round(s, 3) for s in spacing))
 
-    train_files = [occ_dir / (s + ".npy") for s in train]
+    train_files = list(train)
     train_names = list(train)
     if args.extra_train_dir:
         extra = sorted(Path(args.extra_train_dir).glob("*.npy"))
@@ -85,7 +87,7 @@ def main():
 
     sdf_rows, occ_rows = [], []
     for path in train_files:
-        occ = np.load(path)
+        occ = np.load(path) if isinstance(path, Path) else load_occupancy(path, occ_dir)
         if occ.shape != shape:
             raise ValueError("Grid mismatch for " + str(path))
         sdf_rows.append(occupancy_to_sdf(occ, spacing, args.truncation).ravel())
@@ -111,6 +113,7 @@ def main():
     np.savez_compressed(
         MODEL_FILE,
         representation=np.array("sdf"),
+        canonical_side=np.array(CANONICAL_SIDE),
         mean_shape=sdf_mean.astype(np.float32),
         components=sdf_pca.components_.astype(np.float32),
         singular_values=sdf_pca.singular_values_,
@@ -131,7 +134,7 @@ def main():
         path = occ_dir / (subject + ".npy")
         if not path.exists():
             continue
-        gt_occ = np.load(path)
+        gt_occ = load_occupancy(subject, occ_dir)
         gt = gt_occ > 0.5
         sdf = occupancy_to_sdf(gt_occ, spacing, args.truncation).ravel()
         occ = gt_occ.astype(np.float32).ravel()

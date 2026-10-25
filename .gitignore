@@ -43,3 +43,9 @@ data/biplanar/
 data/biplanar_external/
 data/external_occupancy/
 models/*.pt
+
+# Training environment and pipeline outputs
+.venv-train/
+logs/
+data/femur_sides.csv
+models/*.md

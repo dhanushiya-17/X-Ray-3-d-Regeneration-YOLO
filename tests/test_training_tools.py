@@ -7,7 +7,8 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
-from femur_grid import occupancy_to_sdf, downsample_occupancy
+from femur_grid import (DIMENSIONS, femur_side, load_occupancy, occupancy_to_sdf,
+                        downsample_occupancy, read_landmark_frame)
 
 
 def _ellipsoid(shape=(40, 24, 24), radii=(15, 8, 6)):
@@ -67,6 +68,37 @@ class NetworkTests(unittest.TestCase):
             loss = dice_bce_loss(out, torch.zeros_like(out))
             loss.backward()
             self.assertTrue(torch.isfinite(loss))
+
+
+class SideMirroringTests(unittest.TestCase):
+    def _subject(self, root, name, troch_x):
+        d = Path(root) / name
+        d.mkdir()
+        (d / (name + "_palp.inp")).write_text(
+            "femurHeadX=0\nfemurHeadY=0\nfemurHeadZ=0\nheadDirX=0\nheadDirY=0\nheadDirZ=10\n"
+            "greatTrochX={}\ngreatTrochY=0\ngreatTrochZ=0\n".format(troch_x))
+
+    def test_right_femur_maps_onto_left_in_canonical_frame(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            self._subject(tmp, "L1", 50)
+            self._subject(tmp, "R1", -50)
+            self.assertEqual((femur_side("L1", tmp), femur_side("R1", tmp)), ("L", "R"))
+            o_l, r_l = read_landmark_frame("L1", tmp)
+            o_r, r_r = read_landmark_frame("R1", tmp)
+            # A right femur is the left one mirrored in patient X (LPS).
+            p_left = np.array([12.0, -7.0, -150.0])
+            p_right = p_left * np.array([-1.0, 1.0, 1.0])
+            np.testing.assert_allclose(r_l.T @ (p_left - o_l), r_r.T @ (p_right - o_r), atol=1e-9)
+            # Un-mirrored frames differ by the sign of z, which load_occupancy undoes.
+            _, r_raw = read_landmark_frame("R1", tmp, canonical=False)
+            np.testing.assert_allclose(r_raw[:, 2], -r_r[:, 2])
+            occ = np.zeros(DIMENSIONS, np.uint8)
+            occ[10, 20, 5] = 1
+            np.save(Path(tmp) / "R1.npy", occ)
+            np.save(Path(tmp) / "L1.npy", occ)
+            self.assertEqual(load_occupancy("R1", tmp, tmp)[10, 20, DIMENSIONS[2] - 1 - 5], 1)
+            self.assertEqual(load_occupancy("L1", tmp, tmp)[10, 20, 5], 1)
 
 
 if __name__ == "__main__":
