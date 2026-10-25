@@ -145,6 +145,8 @@ body[data-stage="dim"] .stage-glow { opacity: 0; }
 /* ------------------------------------------------------------------ main / pages */
 #view { position: relative; z-index: 5; min-height: 100vh; outline: none; pointer-events: none; }
 #view > * { pointer-events: auto; }
+/* Full-screen page layers let drags and wheel reach the 3D canvas behind them; only their panels take input. */
+#view > .hero, #view > .workspace, #view > .viewer-ui, #view .hero-right { pointer-events: none; }
 .page-enter { animation: rise .7s var(--ease) both; }
 @keyframes rise { from { opacity: 0; transform: translateY(14px); } to { opacity: 1; transform: none; } }
 
