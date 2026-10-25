@@ -4,7 +4,8 @@ run_retraining.py
 Run the femur retraining steps in order and stop at the first result that
 looks wrong, instead of training on bad data:
 
-  1. check     GPU, input data, left/right mixing (check_femur_sides.py)
+  1. check     GPU, input data, left/right sides: right femurs are mirrored onto
+               the left, and the check stops if that does not make them consistent
   2. ssm       SDF shape model + held-out oracle (build_ssm_sdf.py)
   3. dataset   AP + lateral training pairs (build_biplanar_dataset.py),
                with an alignment check of each image against its 3D target
@@ -31,7 +32,7 @@ import time
 
 import numpy as np
 
-from femur_grid import ROOT, OCC_DIR, LANDMARK_ROOT, load_split
+from femur_grid import ROOT, CANONICAL_SIDE, OCC_DIR, LANDMARK_ROOT, load_split
 
 SCRIPTS = ROOT / "scripts"
 MODEL_DIR = ROOT / "models"
@@ -92,27 +93,28 @@ def step_check(opts):
         raise StepFailed("More than 5 subjects are missing input files (see above). The scripts expect "
                          "data/occupancy_highres/<S>.npy and data/raw/Subjects/<S>/<S>.nrrd + <S>_palp.inp.")
 
-    from check_femur_sides import collect
+    from check_femur_sides import collect, summarize
     rows = collect()
-    sides = [r["side"] for r in rows if r["side"]]
-    bows = np.array([r["bow_mm"] for r in rows if r["bow_mm"] != ""], dtype=float)
-    n_left, n_right = sides.count("L"), sides.count("R")
-    n_pos, n_neg = int((bows > 0).sum()), int((bows < 0).sum())
-    print("Side from landmarks: L={} R={}   bow sign: +{} / -{}   median bow {:.2f} mm".format(
-        n_left, n_right, n_pos, n_neg, float(np.median(bows))))
+    s = summarize(rows)
+    raw_pos, raw_neg, _ = s["bow"]
+    pos, neg, median = s["bow_canonical"]
+    print("Side from landmarks: L={} R={}   bow sign as stored: +{} / -{}   "
+          "after mirroring to {}: +{} / -{} (median {:.2f} mm)".format(
+              s["left"], s["right"], raw_pos, raw_neg, CANONICAL_SIDE, pos, neg, median))
     with (MODEL_DIR / "femur_sides.csv").open("w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=list(rows[0]))
         writer.writeheader()
         writer.writerows(rows)
-    if min(n_left, n_right) > 2:
-        raise StepFailed("The data mixes left ({}) and right ({}) femurs. Training now would average "
-                         "mirror-image shapes. Per-subject details: models/femur_sides.csv".format(n_left, n_right))
-    minority = min(n_pos, n_neg)
-    if minority > max(3, 0.1 * len(bows)):
-        raise StepFailed("All femurs are one side, but {} of {} have the opposite bow direction. "
-                         "Their 3D targets may be flipped. See models/femur_sides.csv".format(minority, len(bows)))
-    return "{} subjects, side {}, bow consistent ({} of {})".format(
-        len(rows), "L" if n_left > n_right else "R", max(n_pos, n_neg), len(bows))
+    # Mirroring must make the bow direction consistent; if it does not, the
+    # side labels or the targets are not what we assume, so stop.
+    minority, total = min(pos, neg), pos + neg
+    if minority > max(3, 0.1 * total):
+        raise StepFailed("After mirroring the right femurs, {} of {} still bow the opposite way, so "
+                         "mirroring does not make the shapes consistent. See models/femur_sides.csv".format(
+                             minority, total))
+    n_mirror = s["right"] if CANONICAL_SIDE == "L" else s["left"]
+    return "{} subjects ({} L, {} R; {} mirrored to {}), bow consistent in {} of {}".format(
+        len(rows), s["left"], s["right"], n_mirror, CANONICAL_SIDE, max(pos, neg), total)
 
 
 def step_ssm(opts):

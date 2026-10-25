@@ -38,7 +38,7 @@ import numpy as np
 import SimpleITK as sitk
 
 from femur_grid import (ROOT, BOUNDS, DIMENSIONS, OCC_DIR, LANDMARK_ROOT, SPLIT_FILE,
-                        grid_spacing, load_split, read_landmark_frame)
+                        grid_spacing, load_occupancy, load_split, read_landmark_frame)
 
 OUTPUT_DIR = ROOT / "data" / "biplanar"
 MU_WATER = 0.02  # 1/mm, approximate linear attenuation of water at ~70 keV
@@ -119,7 +119,9 @@ def main():
                 raise FileNotFoundError(ct_path if not ct_path.exists() else occ_path)
             origin, R = frame if frame is not None else read_landmark_frame(subject)
             ap, lat = project_subject(ct_path, origin, R, args.slab_mm, args.slab_step)
-            occ = np.load(occ_path).astype(np.uint8)
+            # HFValid: frame and target are both mirrored onto CANONICAL_SIDE.
+            occ = (np.load(occ_path) if frame is not None
+                   else load_occupancy(subject, occ_path.parent)).astype(np.uint8)
             if occ.shape != DIMENSIONS:
                 raise ValueError("occupancy grid " + str(occ.shape))
             np.savez_compressed(out, ap=ap, lat=lat, occ=occ, ct=np.array(args.ct))

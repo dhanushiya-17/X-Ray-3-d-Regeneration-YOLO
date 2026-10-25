@@ -24,6 +24,8 @@ OCC_DIR = ROOT / "data" / "occupancy_highres"
 LANDMARK_ROOT = ROOT / "data" / "raw" / "Subjects"
 
 BOUNDS = (-470.0, 40.0, -60.0, 100.0, -70.0, 70.0)
+# HFValid mixes left and right femurs; the right ones are mirrored onto this side.
+CANONICAL_SIDE = "L"
 DIMENSIONS = (256, 96, 96)
 
 
@@ -42,27 +44,58 @@ def load_split(split_file=SPLIT_FILE):
     return {k: sorted(v) for k, v in splits.items()}
 
 
-def read_landmark_frame(subject, landmark_root=LANDMARK_ROOT):
-    """Return (origin, R) so that anatomical q = R.T @ (p - origin)."""
+def read_landmarks(subject, landmark_root=LANDMARK_ROOT):
+    """Return the palpated landmarks of a subject as {name: xyz} in CT physical space."""
     path = Path(landmark_root) / subject / (subject + "_palp.inp")
     values = {}
     for line in path.read_text().splitlines():
         if "=" in line:
             key, value = line.split("=", 1)
             values[key.strip()] = float(value.strip())
+    names = {key[:-1] for key in values if key[-1:] in "XYZ"}
+    return {name: np.array([values[name + "X"], values[name + "Y"], values[name + "Z"]],
+                           dtype=np.float64)
+            for name in names if all(name + a in values for a in "XYZ")}
 
-    def point(prefix):
-        return np.array([values[prefix + "X"], values[prefix + "Y"],
-                         values[prefix + "Z"]], dtype=np.float64)
 
-    origin, head_dir, troch = point("femurHead"), point("headDir"), point("greatTroch")
-    x = head_dir - origin
+def femur_side(subject, landmark_root=LANDMARK_ROOT):
+    """'L' or 'R'. CT physical space is LPS (+X = patient left) and the greater
+    trochanter is lateral to the femoral head."""
+    p = read_landmarks(subject, landmark_root)
+    return "L" if p["greatTroch"][0] > p["femurHead"][0] else "R"
+
+
+def read_landmark_frame(subject, landmark_root=LANDMARK_ROOT, canonical=True):
+    """Return (origin, R) so that anatomical q = R.T @ (p - origin).
+
+    z = x × y is right-handed, so left and right femurs come out as mirror
+    images of each other. With canonical=True the z axis is flipped for femurs
+    that are not CANONICAL_SIDE, which mirrors them onto that side; R then
+    contains a reflection. load_occupancy applies the same flip to the targets.
+    """
+    p = read_landmarks(subject, landmark_root)
+    origin = p["femurHead"]
+    x = p["headDir"] - origin
     x /= np.linalg.norm(x)
-    y = troch - origin
+    y = p["greatTroch"] - origin
     y -= np.dot(y, x) * x
     y /= np.linalg.norm(y)
     z = np.cross(x, y)
+    if canonical and femur_side(subject, landmark_root) != CANONICAL_SIDE:
+        z = -z
     return origin, np.column_stack((x, y, z))
+
+
+def load_occupancy(subject, occ_dir=OCC_DIR, landmark_root=LANDMARK_ROOT, canonical=True):
+    """Load an occupancy target, mirrored onto CANONICAL_SIDE when canonical=True.
+
+    The targets were built in the un-mirrored frame. Z bounds are symmetric
+    about 0, so negating z is a flip of the last grid axis.
+    """
+    occ = np.load(Path(occ_dir) / (subject + ".npy"))
+    if canonical and femur_side(subject, landmark_root) != CANONICAL_SIDE:
+        occ = np.ascontiguousarray(occ[:, :, ::-1])
+    return occ
 
 
 def occupancy_to_sdf(occ, spacing, truncation=20.0):
