@@ -134,15 +134,38 @@ def step_ssm(opts):
     return "SDF oracle IoU {:.3f} vs occupancy {:.3f} (k={})".format(sdf, occ, k_max)
 
 
-def alignment_score(sample):
-    """Mean AP / lateral intensity inside the projected femur over the mean outside it."""
+def _highpass(a, sigma=6.0):
+    from scipy import ndimage as ndi
+    a = a.astype(np.float64)
+    return a - ndi.gaussian_filter(a, sigma)
+
+
+def _corr(a, b):
+    a, b = a - a.mean(), b - b.mean()
+    return float((a * b).sum() / max(np.sqrt((a * a).sum() * (b * b).sum()), 1e-12))
+
+
+def alignment_margin(sample, shift=8):
+    """How much better each view lines up with its target than with shifted copies of it.
+
+    Both the image and the projected target silhouette are high-pass filtered,
+    which removes the smooth soft-tissue background and keeps the bone edges,
+    then correlated. A matching pair correlates best unshifted; a misaligned
+    pair does no better than a shifted silhouette. Returns the smaller margin
+    of the two views (aligned correlation minus the best shifted one; > 0
+    means the target is where the image says the femur is).
+    """
     d = np.load(sample)
-    scores = []
+    margins = []
     for img, mask in ((d["ap"], d["occ"].any(axis=2)), (d["lat"], d["occ"].any(axis=1))):
-        if not np.isfinite(img).all() or img.max() <= 0 or not mask.any() or mask.all():
-            return 0.0
-        scores.append(float(img[mask].mean() / max(img[~mask].mean(), 1e-6)))
-    return min(scores)
+        if not np.isfinite(img).all() or img.max() <= 0 or not mask.any():
+            return -1.0
+        hp = _highpass(img)
+        aligned = _corr(hp, _highpass(mask))
+        shifted = max(_corr(hp, _highpass(np.roll(mask, k, axis=ax)))
+                      for ax in (0, 1) for k in (-shift, shift))
+        margins.append(aligned - shifted)
+    return min(margins)
 
 
 def step_dataset(opts):
@@ -157,15 +180,19 @@ def step_dataset(opts):
         if per_split[name] < 0.9 * len(n):
             raise StepFailed("Only {}/{} {} samples were built. Errors: data/biplanar/dataset_report.csv".format(
                 per_split[name], len(n), name))
-    scores = {s: alignment_score(p) for s, p in have.items()}
-    bad = sorted((v, s) for s, v in scores.items() if v < 1.3)
-    print("Image/target alignment (femur vs background brightness): median {:.2f}, lowest {}".format(
-        float(np.median(list(scores.values()))),
-        ", ".join("{} {:.2f}".format(s, v) for v, s in sorted((v, s) for s, v in scores.items())[:3])))
+    scores = {s: alignment_margin(p) for s, p in have.items()}
+    ranked = sorted((v, s) for s, v in scores.items())
+    bad = [s for v, s in ranked if v <= 0.0]
+    median = float(np.median(list(scores.values())))
+    print("Image/target alignment (true silhouette vs shifted, >0 is aligned): median {:.2f}, lowest {}".format(
+        median, ", ".join("{} {:.2f}".format(s, v) for v, s in ranked[:3])))
+    if bad:
+        print("Weakly aligned samples:", ", ".join(bad))
     if len(bad) > 0.1 * len(scores):
-        raise StepFailed("{} samples have the femur no brighter than the background in at least one view, "
-                         "so the images and 3D targets do not line up. Check the landmark frame.".format(len(bad)))
-    return "{} samples, alignment median {:.2f}".format(len(have), float(np.median(list(scores.values()))))
+        raise StepFailed("{} samples line up with their 3D target no better than with a shifted copy of it, "
+                         "so the images and targets do not match. Check the landmark frame.".format(len(bad)))
+    return "{} samples, alignment median {:.2f}{}".format(
+        len(have), median, ", weak: " + " ".join(bad) if bad else "")
 
 
 def checkpoint(views, opts):
