@@ -37,7 +37,9 @@ FILES = {
 }
 
 
-def stl_bytes(vertices: np.ndarray, faces: np.ndarray, header: bytes = b"BoneVision single-view SSM estimate") -> bytes:
+def stl_bytes(vertices: np.ndarray, faces: np.ndarray, header: bytes = b"BoneVision single-view SSM estimate SPACE=RAS") -> bytes:
+    """Binary STL. The SPACE=RAS header tag makes 3D Slicer load the coordinates unchanged (it reads
+    untagged STLs as LPS and flips x and y); the frame is still the canonical one, not the patient's."""
     tri = vertices[faces].astype(np.float32)
     normals = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
     normals /= np.maximum(np.linalg.norm(normals, axis=1, keepdims=True), 1e-12)
@@ -147,6 +149,8 @@ def report_dict(result: dict, input_meta: dict | None, crop_box=None) -> dict:
 
 
 def build_file(name: str, result: dict, image: np.ndarray, input_meta: dict | None = None, crop_box=None) -> bytes:
+    if is_network(result):
+        return build_network_file(name, result, input_meta)
     v, f = result["vertices_mm"], result["faces"]
     if name == "femur_estimate.stl":
         return stl_bytes(v, f)
@@ -166,6 +170,8 @@ def build_file(name: str, result: dict, image: np.ndarray, input_meta: dict | No
 
 
 def bundle_zip(result: dict, image: np.ndarray, input_meta: dict | None = None, crop_box=None) -> bytes:
+    if is_network(result):
+        return network_bundle_zip(result, input_meta)
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
         for name in FILES:
@@ -188,3 +194,130 @@ def write_outputs(result: dict, image: np.ndarray, output_dir, input_meta=None, 
         p.write_bytes(build_file(p.name, result, image, input_meta, crop_box))
     return paths
 
+
+
+# ------------------------------------------------------------- learned network
+
+NETWORK_FRAME = (
+    "Femur landmark frame in millimetres, the network's training grid: origin at the femoral head, "
+    "+X along the femoral long axis (distal is negative X), +Y toward the greater trochanter, Z = X × Y. "
+    "Always a LEFT femur (right legs are mirrored onto the left). The STL and NRRD are tagged as Slicer RAS so "
+    "they load unchanged and overlap exactly. This is NOT patient RAS/LPS space."
+)
+NETWORK_LIMITATIONS = [
+    "Research estimate only; not for diagnosis, treatment or surgical planning.",
+    "The network was trained on simulated X-rays (DRRs) from 101 HFValid CTs and has not been validated on real radiographs.",
+    "Femur length is set to the training mean; uploaded images carry no reliable physical scale.",
+    "Views are assumed to be true AP and true lateral of the same femur. An AP-only estimate takes depth from what the network learned.",
+    "Segmentation is classical thresholding and can select the wrong region; check each mask before trusting the shape.",
+    "The voxel grid is about 4 mm, so fine surface detail is smoothed.",
+]
+VIEW_ARRAYS = ("mask", "target_projection", "projection", "grid_to_image", "input_image")
+MESH_NAME, LABELMAP_NAME, NETWORK_REPORT = "femur_reconstruction.stl", "femur_labelmap.nrrd", "reconstruction.json"
+
+
+def is_network(result: dict) -> bool:
+    return result.get("backend") == "multiview-net"
+
+
+def network_files(result: dict) -> dict:
+    files = {
+        MESH_NAME: ("model/stl", "Binary STL mesh tagged as RAS for 3D Slicer (File → Add Data)."),
+        LABELMAP_NAME: ("application/octet-stream", "Voxel labelmap (1 = femur) on the same grid, for Slicer slice views and Segment Editor."),
+        "femur_estimate.obj": ("text/plain", "Wavefront OBJ mesh for Blender, MeshLab and most 3D tools."),
+        NETWORK_REPORT: ("application/json", "Checkpoint, views, per-view agreement, warnings, coordinate frame and limits."),
+        "view_fit.png": ("image/png", "Each view on the network grid: traced outline (red) against the estimate's silhouette (cyan)."),
+    }
+    for view in result["views"]:
+        files[f"input_overlay_{view['kind']}.png"] = ("image/png", f"Your {'AP' if view['kind'] == 'ap' else 'lateral'} X-ray with its mask and the estimate's outline mapped back.")
+    return files
+
+
+def network_report(result: dict, input_meta: dict | None) -> dict:
+    from pathlib import Path
+
+    from . import network  # noqa: F401  (puts scripts/ on the import path)
+    from slicer_export import slicer_info
+    slicer = slicer_info() | {"coordinate_frame": NETWORK_FRAME}
+    return {
+        "generated_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "software": {"name": "BoneVision", "pipeline_version": result["pipeline_version"]},
+        "method": result["method_label"], "backend": result["backend"],
+        "inputs": (input_meta or {}).get("views", []),
+        "checkpoint": Path(result["checkpoint"]).name, "model_views": result["model_views"],
+        "checkpoint_validation_synthetic": result["checkpoint_validation"],
+        "fit_status": result["fit_status"],
+        "metrics": {
+            "mean_view_silhouette_dice": result["projection_dice"], "min_view_silhouette_dice": result["min_view_dice"],
+            "meaning": "2D overlap between each traced outline and the estimate's silhouette on the network grid. Not 3D accuracy.",
+        },
+        "orientation_hypotheses_tested": result["hypotheses_tested"],
+        "views": [{k: v for k, v in view.items() if k not in VIEW_ARRAYS} for view in result["views"]],
+        "ignored_views": result["ignored_views"],
+        "mesh": {"vertices": int(len(result["vertices_mm"])), "faces": int(len(result["faces"])),
+                 "dimensions_mm": result["dimensions_mm"], "units": "mm", "coordinate_frame": NETWORK_FRAME},
+        "grid": {"shape": list(result["grid_shape"]), "spacing_mm": list(result["spacing_mm"]), "bounds_mm": list(result["bounds"])},
+        "canonical_side": result["canonical_side"],
+        "output_mesh": MESH_NAME, "output_labelmap": LABELMAP_NAME, "slicer": slicer,
+        "timings_s": {"total": result["elapsed_seconds"]}, "device": result["device"],
+        "warnings": result["warnings"],
+        "limitations": NETWORK_LIMITATIONS,
+    }
+
+
+def view_fit_png(result: dict, upscale: int = 3) -> bytes:
+    """Per-view canvases on the network grid: green = overlap, warm = outline only, blue = estimate only."""
+    panels = []
+    for view in result["views"]:
+        tgt = view["target_projection"].astype(bool)
+        pred = view["projection"] >= 0.5
+        rgb = np.full(tgt.shape + (3,), (14, 20, 27), dtype=np.uint8)
+        rgb[tgt & pred] = (120, 200, 160)
+        rgb[tgt & ~pred] = (237, 158, 89)
+        rgb[~tgt & pred] = (120, 190, 245)
+        panels.append(rgb[::-1])             # grid row 0 is the knee; show the head at the top
+    height = max(p.shape[0] for p in panels)
+    padded = [np.pad(p, ((0, height - p.shape[0]), (0, 6), (0, 0)), constant_values=40) for p in panels]
+    return png_bytes(np.kron(np.concatenate(padded, axis=1), np.ones((upscale, upscale, 1), dtype=np.uint8)))
+
+
+def build_network_file(name: str, result: dict, input_meta: dict | None = None) -> bytes:
+    from .network import overlay_view
+    from slicer_export import labelmap_bytes, stl_bytes as ras_stl_bytes
+    v, f = result["vertices_mm"], result["faces"]
+    if name == MESH_NAME:
+        return ras_stl_bytes(v, f, "BoneVision network femur estimate")
+    if name == LABELMAP_NAME:
+        return labelmap_bytes(result["occupancy"], result["bounds"])
+    if name == "femur_estimate.obj":
+        return obj_bytes(v, f).replace(b"single-view SSM estimate (millimetres, canonical SSM frame)",
+                                       b"network estimate (millimetres, femur landmark frame, left femur)", 1)
+    if name == NETWORK_REPORT:
+        return json.dumps(network_report(result, input_meta), indent=2, default=float).encode("utf-8")
+    if name == "view_fit.png":
+        return view_fit_png(result)
+    for view in result["views"]:
+        if name == f"input_overlay_{view['kind']}.png":
+            return png_bytes(overlay_view(view, view["input_image"]))
+    raise KeyError(name)
+
+
+def network_bundle_zip(result: dict, input_meta: dict | None = None) -> bytes:
+    """All network files plus the Slicer loader in one folder: run BoneVisionLoader.py from it to open everything."""
+    from pathlib import Path
+    loader = Path(__file__).resolve().parents[1] / "slicer" / "BoneVisionLoader" / "BoneVisionLoader.py"
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for name in network_files(result):
+            z.writestr(f"bonevision_femur/{name}", build_network_file(name, result, input_meta))
+        if loader.exists():
+            z.write(loader, f"bonevision_femur/{loader.name}")
+        z.writestr("bonevision_femur/README.txt", "BoneVision network export\n\n" + NETWORK_FRAME
+                   + "\n\nIn 3D Slicer: File > Add Data on femur_reconstruction.stl (tick LabelMap for the NRRD), or run\n"
+                   + "  Slicer --python-script BoneVisionLoader.py\nfrom this folder.\n\n"
+                   + "\n".join("- " + x for x in NETWORK_LIMITATIONS) + "\n")
+    return buf.getvalue()
+
+
+def files_for(result: dict) -> dict:
+    return network_files(result) if is_network(result) else FILES

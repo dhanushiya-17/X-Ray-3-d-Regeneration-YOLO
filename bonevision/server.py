@@ -25,7 +25,8 @@ from PIL import Image
 from pydantic import BaseModel, Field
 
 from . import __version__
-from .exports import FILES, build_file, bundle_zip
+from . import network
+from .exports import build_file, bundle_zip, files_for
 from .pipeline import (
     HYPOTHESES, MODEL_PATH, ROOT, FitCancelled, apply_crop, input_quality_warnings, load_model,
     mean_shape_mesh, read_image_bytes, reconstruct, segment_single_bone,
@@ -131,6 +132,13 @@ def status():
         except Exception as exc:  # corrupt or incompatible model file
             info["model_available"] = False
             info["model_error"] = f"{type(exc).__name__}: {exc}"
+    net = network.status()
+    info["methods"] = {
+        "network": {"label": "Learned network", "views": "AP + optional lateral", **net},
+        "ssm": {"label": "Shape-model fit", "views": "one AP", "available": info["model_available"],
+                "problem": None if info["model_available"] else info.get("model_error") or f"No shape model at {path.name}"},
+    }
+    info["default_method"] = "network" if net["available"] else "ssm"
     return info
 
 
@@ -209,8 +217,18 @@ def delete_upload(uid: str):
 
 # -------------------------------------------------------------------------- cases
 
-class CaseRequest(BaseModel):
+class ViewRequest(BaseModel):
     upload_id: str
+    kind: str = "ap"
+    crop: dict = Field(default_factory=dict)
+    polarity: str = "auto"
+    threshold_bias: float = Field(0.0, ge=-0.25, le=0.25)
+
+
+class CaseRequest(BaseModel):
+    method: str = "ssm"
+    upload_id: str | None = None
+    views: list[ViewRequest] = Field(default_factory=list, max_length=2)
     crop: dict = Field(default_factory=dict)
     polarity: str = "auto"
     threshold_bias: float = Field(0.0, ge=-0.25, le=0.25)
@@ -221,13 +239,38 @@ class CaseRequest(BaseModel):
     spread: bool = True
 
 
+def _network_summary(case: dict, r: dict) -> dict:
+    files = files_for(r)
+    return _jsonable({
+        "method": "network", "method_label": r["method_label"], "score": r["projection_dice"],
+        "silhouette_soft_dice": r["projection_dice"], "min_view_dice": r["min_view_dice"],
+        "views": [{k: v[k] for k in ("kind", "view_type", "name", "soft_dice", "mirrored", "flipped_long_axis",
+                                     "orientation_match", "orientation_margin", "assumed_mm_per_pixel", "segmentation")}
+                  | {"crop_box": inp["crop_box"], "image_shape": list(inp["image"].shape), "input": {k: inp["meta"].get(k) for k in ("source_name", "format", "shape")}}
+                  for v, inp in zip(r["views"], case["views_input"])],
+        "ignored_views": r["ignored_views"], "checkpoint": Path(r["checkpoint"]).name, "model_views": r["model_views"],
+        "checkpoint_validation": r["checkpoint_validation"], "hypotheses_tested": r["hypotheses_tested"],
+        "network_downsample": r["network_downsample"], "canonical_side": r["canonical_side"],
+        "warnings": r["warnings"], "elapsed_seconds": r["elapsed_seconds"], "device": r["device"],
+        "dimensions_mm": r["dimensions_mm"], "spacing_mm": r["spacing_mm"], "grid_shape": r["grid_shape"],
+        "mesh": {"vertices": len(r["vertices_mm"]), "faces": len(r["faces"])},
+        "report_file": "reconstruction.json",
+        "files": [{"name": n, "type": t, "description": d, "bytes": len(case["files"][n])} for n, (t, d) in files.items() if n in case["files"]],
+    })
+
+
 def _summary(case: dict) -> dict:
     out = {k: case[k] for k in ("id", "status", "stage", "iteration", "total", "loss", "error", "created", "started", "finished", "name")}
+    out["method"] = case["request"]["method"]
     out["settings"] = case["request"]
     out["live_history"] = case["live_history"][-400:]
     r = case.get("result")
-    if r is not None:
+    if r is not None and out["method"] == "network":
+        out["result"] = _network_summary(case, r)
+    elif r is not None:
+        files = files_for(r)
         out["result"] = _jsonable({
+            "method": "ssm", "score": r["projection_dice"], "report_file": "report.json",
             "silhouette_soft_dice": r["projection_dice"], "objective": r["objective"],
             "hypothesis": {k: r["hypothesis"][k] for k in ("id", "label", "meaning", "index")},
             "hypotheses": [{k: h[k] for k in ("id", "label", "meaning", "loss", "soft_dice")} for h in r["hypotheses"]],
@@ -243,7 +286,7 @@ def _summary(case: dict) -> dict:
             "history": r["history"], "history_all": r["history_all"], "model": r["model"],
             "input": {k: case["meta"].get(k) for k in ("source_name", "format", "sha256", "shape", "pixel_spacing_mm", "spacing_source")},
             "crop_box": case["crop_box"], "image_shape": list(case["image"].shape),
-            "files": [{"name": n, "type": FILES[n][0], "description": FILES[n][1], "bytes": len(case["files"][n])} for n in FILES if n in case["files"]],
+            "files": [{"name": n, "type": files[n][0], "description": files[n][1], "bytes": len(case["files"][n])} for n in files if n in case["files"]],
         })
     return out
 
@@ -264,14 +307,18 @@ def _run_case(cid: str):
             case["live_history"].append([i, loss])
 
     try:
-        model = load_model(model_path(), model_device())
-        case["explained_ratio"] = model.explained_ratio
         req = case["request"]
-        result = reconstruct(case["image"], model, req["iterations"], req["polarity"], req["threshold_bias"],
-                             prior_weight=req["prior_weight"], mm_per_pixel=case["mm_per_pixel"], spread=req["spread"],
-                             progress=progress, cancel=case["cancel"].is_set)
+        if req["method"] == "network":
+            case["stage"] = "segmenting"
+            result = network.reconstruct_views(case["views_input"], model_device(), progress=progress, cancel=case["cancel"].is_set)
+        else:
+            model = load_model(model_path(), model_device())
+            case["explained_ratio"] = model.explained_ratio
+            result = reconstruct(case["image"], model, req["iterations"], req["polarity"], req["threshold_bias"],
+                                 prior_weight=req["prior_weight"], mm_per_pixel=case["mm_per_pixel"], spread=req["spread"],
+                                 progress=progress, cancel=case["cancel"].is_set)
         case["stage"] = "writing exports"
-        case["files"] = {n: build_file(n, result, case["image"], case["meta"], case["crop_box"]) for n in FILES}
+        case["files"] = {n: build_file(n, result, case["image"], case["meta"], case["crop_box"]) for n in files_for(result)}
         case["result"] = result
         case.update(status="done", stage="done", finished=time.time())
     except FitCancelled:
@@ -280,8 +327,56 @@ def _run_case(cid: str):
         case.update(status="failed", stage="failed", error=str(exc), finished=time.time())
 
 
+def _network_case(req: CaseRequest) -> dict:
+    net = network.status()
+    if not net["available"]:
+        raise HTTPException(503, net["problem"])
+    kinds = [v.kind for v in req.views]
+    if any(k not in network.VIEW_ANGLES for k in kinds):
+        raise HTTPException(422, "Each view must be 'ap' or 'lat'")
+    if kinds.count("ap") != 1 or kinds.count("lat") > 1:
+        raise HTTPException(422, "The network needs exactly one AP view and at most one lateral view")
+    views = []
+    for v in sorted(req.views, key=lambda v: v.kind != "ap"):   # AP first
+        if v.polarity not in ("auto", "bright", "dark"):
+            raise HTTPException(422, "polarity must be auto, bright or dark")
+        up = _get(_uploads, v.upload_id, "Upload")
+        try:
+            image, box = apply_crop(up["image"], v.crop)
+        except ValueError as exc:
+            raise HTTPException(422, f"{network.VIEW_LABELS[v.kind]} view: {exc}") from exc
+        views.append({"image": image, "kind": v.kind, "name": f"{network.VIEW_LABELS[v.kind]} view",
+                      "polarity": v.polarity, "threshold_bias": v.threshold_bias, "crop_box": box, "meta": up["meta"]})
+    ap = views[0]
+    meta = dict(ap["meta"]) | {"views": [{"kind": v["kind"], "crop_box_rows_cols": list(v["crop_box"])}
+                                         | {k: v["meta"].get(k) for k in ("source_name", "format", "sha256", "shape")} for v in views]}
+    name = " + ".join(v["meta"].get("source_name") or v["kind"] for v in views)
+    return {"name": name, "image": ap["image"], "meta": meta, "crop_box": ap["crop_box"], "mm_per_pixel": None,
+            "views_input": views, "total": 0}
+
+
 @app.post("/api/cases")
 def create_case(req: CaseRequest):
+    if req.method not in ("ssm", "network"):
+        raise HTTPException(422, "method must be ssm or network")
+    if req.method == "network":
+        fields = _network_case(req)
+    else:
+        fields = _ssm_case(req)
+    cid = uuid.uuid4().hex[:12]
+    case = {"id": cid, "request": req.model_dump(), "status": "queued", "stage": "queued", "iteration": 0,
+            "loss": None, "error": None, "created": time.time(), "started": None, "finished": None, "live_history": [],
+            "cancel": threading.Event(), "files": {}, "result": None, "explained_ratio": None, **fields}
+    with _lock:
+        _cases[cid] = case
+        _trim(_cases, MAX_CASES)
+    _executor.submit(_run_case, cid)
+    return {"id": cid}
+
+
+def _ssm_case(req: CaseRequest) -> dict:
+    if not req.upload_id:
+        raise HTTPException(422, "upload_id is required for the shape-model fit")
     up = _get(_uploads, req.upload_id, "Upload")
     if not model_path().exists():
         raise HTTPException(503, f"No shape model at {model_path().name}. Build it with scripts/build_ssm_v2.py, or run serve.py --demo.")
@@ -299,24 +394,15 @@ def create_case(req: CaseRequest):
         if abs(spacing[0] - spacing[1]) > 1e-3:
             raise HTTPException(422, "Anisotropic DICOM pixel spacing is not supported yet")
         mm_per_pixel = spacing[0] / req.magnification
-    cid = uuid.uuid4().hex[:12]
-    case = {"id": cid, "name": up["meta"].get("source_name") or "upload", "request": req.model_dump(),
-            "status": "queued", "stage": "queued", "iteration": 0, "total": req.iterations, "loss": None,
-            "error": None, "created": time.time(), "started": None, "finished": None, "live_history": [],
-            "image": image, "meta": up["meta"], "crop_box": box, "mm_per_pixel": mm_per_pixel,
-            "cancel": threading.Event(), "files": {}, "result": None, "explained_ratio": None}
-    with _lock:
-        _cases[cid] = case
-        _trim(_cases, MAX_CASES)
-    _executor.submit(_run_case, cid)
-    return {"id": cid}
+    return {"name": up["meta"].get("source_name") or "upload", "image": image, "meta": up["meta"], "crop_box": box,
+            "mm_per_pixel": mm_per_pixel, "total": req.iterations}
 
 
 @app.get("/api/cases")
 def list_cases():
     with _lock:
         items = list(_cases.values())
-    return [{k: c[k] for k in ("id", "name", "status", "created", "finished")} | (
+    return [{k: c[k] for k in ("id", "name", "status", "created", "finished")} | {"method": c["request"]["method"]} | (
         {"silhouette_soft_dice": c["result"]["projection_dice"]} if c.get("result") else {}) for c in reversed(items)]
 
 
@@ -359,11 +445,12 @@ def case_mesh(cid: str):
 @app.get("/api/cases/{cid}/files/{name}")
 def case_file(cid: str, name: str, inline: bool = False):
     case = _done(cid)
-    if name not in FILES:
+    files = files_for(case["result"])
+    if name not in files:
         raise HTTPException(404, "Unknown export")
     data = case["files"].get(name) or build_file(name, case["result"], case["image"], case["meta"], case["crop_box"])
     disposition = "inline" if inline else "attachment"
-    return Response(data, media_type=FILES[name][0], headers={"Content-Disposition": f'{disposition}; filename="{name}"', "Cache-Control": "no-store"})
+    return Response(data, media_type=files[name][0], headers={"Content-Disposition": f'{disposition}; filename="{name}"', "Cache-Control": "no-store"})
 
 
 @app.get("/api/cases/{cid}/bundle.zip")
@@ -403,7 +490,7 @@ def evaluation():
         found.append({"file": path.name, "aggregate": mean, "n_ok": len(per),
                       "n_failed": sum(1 for r in rows if r.get("status") == "error"),
                       "subjects": [{k: r.get(k) for k in ("subject", "ssm_dice", "ssm_mean_symmetric_surface_distance_mm", "retrieval_dice")} for r in per]})
-    return {"reported": REPORTED_SYNTHETIC, "local_runs": found}
+    return {"reported": REPORTED_SYNTHETIC, "network": network.REPORTED_TEST, "local_runs": found}
 
 
 # ----------------------------------------------------------------------- frontend

@@ -270,6 +270,81 @@ class Api(unittest.TestCase):
         self.assertEqual(c.get("/api/cases/nope").status_code, 404)
 
 
+@unittest.skipUnless(HAVE_TORCH, "PyTorch is not installed")
+class NetworkApi(unittest.TestCase):
+    """The learned-network path end to end, on a tiny network trained here on synthetic shapes."""
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            from fastapi.testclient import TestClient
+        except Exception:
+            raise unittest.SkipTest("fastapi/httpx not installed")
+        from make_demo_network import build
+        paths = build(Path(_TMP.name) / "net", subjects=10, steps=120, log=lambda *_: None)
+        os.environ["BONEVISION_NET_AP_LAT"] = str(paths[("ap", "lat")])
+        os.environ["BONEVISION_NET_AP"] = str(paths[("ap",)])
+        os.environ["BONEVISION_DEVICE"] = "cpu"
+        from bonevision import network
+        network._backend = None                       # pick up the checkpoints set above
+        from bonevision.server import app
+        cls.c = TestClient(app)
+
+    def _upload(self, image):
+        buf = io.BytesIO()
+        Image.fromarray((image * 255).astype(np.uint8)).save(buf, format="PNG")
+        return self.c.post("/api/uploads", files={"file": ("x.png", buf.getvalue(), "image/png")}).json()["id"]
+
+    def _run(self, views):
+        import time
+        resp = self.c.post("/api/cases", json={"method": "network", "views": views})
+        self.assertEqual(resp.status_code, 200, resp.text)
+        cid = resp.json()["id"]
+        for _ in range(600):
+            st = self.c.get(f"/api/cases/{cid}").json()
+            if st["status"] not in ("queued", "running"):
+                break
+            time.sleep(0.1)
+        self.assertEqual(st["status"], "done", st.get("error"))
+        return cid, st["result"]
+
+    def test_status_offers_the_network(self):
+        st = self.c.get("/api/status").json()
+        self.assertTrue(st["methods"]["network"]["available"])
+        self.assertTrue(st["methods"]["network"]["synthetic_demo"])
+        self.assertEqual(st["default_method"], "network")
+
+    def test_ap_and_lateral_case_produces_slicer_files(self):
+        ap = self._upload(synthetic_xray(mirror=True, angle=10.0))
+        lat = self._upload(synthetic_xray(mirror=False, angle=-5.0))
+        cid, r = self._run([{"upload_id": lat, "kind": "lat"}, {"upload_id": ap, "kind": "ap"}])
+        self.assertEqual(r["model_views"], ["ap", "lat"])
+        self.assertEqual([v["kind"] for v in r["views"]], ["ap", "lat"])
+        self.assertTrue(r["views"][0]["mirrored"])
+        names = {f["name"] for f in r["files"]}
+        self.assertTrue({"femur_reconstruction.stl", "femur_labelmap.nrrd", "reconstruction.json",
+                         "input_overlay_ap.png", "input_overlay_lat.png"} <= names)
+        stl = self.c.get(f"/api/cases/{cid}/files/femur_reconstruction.stl").content
+        self.assertIn(b"SPACE=RAS", stl[:80])
+        report = self.c.get(f"/api/cases/{cid}/files/reconstruction.json").json()
+        self.assertEqual(report["slicer"]["mesh"], "femur_reconstruction.stl")
+        self.assertIn("left femur", report["mesh"]["coordinate_frame"].lower())
+        with zipfile.ZipFile(io.BytesIO(self.c.get(f"/api/cases/{cid}/bundle.zip").content)) as z:
+            self.assertIn("bonevision_femur/BoneVisionLoader.py", z.namelist())
+        self.assertEqual(self.c.get(f"/api/cases/{cid}/files/report.json").status_code, 404)
+        self.assertGreater(self.c.get(f"/api/cases/{cid}/mesh").json()["vertex_count"], 1000)
+
+    def test_ap_only_uses_the_ap_checkpoint(self):
+        _, r = self._run([{"upload_id": self._upload(synthetic_xray()), "kind": "ap"}])
+        self.assertEqual(r["model_views"], ["ap"])
+
+    def test_view_rules_are_enforced(self):
+        lat = self._upload(synthetic_xray())
+        for views in ([{"upload_id": lat, "kind": "lat"}], [{"upload_id": lat, "kind": "oblique"}],
+                      [{"upload_id": lat, "kind": "ap"}, {"upload_id": lat, "kind": "ap"}]):
+            self.assertEqual(self.c.post("/api/cases", json={"method": "network", "views": views}).status_code, 422)
+
+
 @unittest.skipUnless(MODEL_PATH.exists(), "real SSM (models/ssm_highres.npz) is not available")
 class RealModel(unittest.TestCase):
     def test_ssm_grid_spacing_is_positive_physical_mm(self):

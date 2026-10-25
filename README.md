@@ -1,16 +1,30 @@
-# BoneVision: single-view femur shape estimation
+# BoneVision: femur reconstruction from X-rays
 
-BoneVision is a research prototype that estimates a 3D femur surface from **one AP radiograph**. It traces the bone in the image, fits a CT-trained statistical shape model (SSM) to that outline, and returns a mesh you can orbit in the browser and open in 3D Slicer.
+BoneVision is a research prototype that estimates a 3D femur surface from an **AP radiograph, optionally with a lateral one**. It traces the bone in each image and reconstructs it with one of two methods, then returns a mesh you can orbit in the browser and open in 3D Slicer:
 
-> **Research estimate, not a measurement.** One projection does not determine hidden depth; depth (and, without calibration, size) comes from the population prior. Silhouette agreement is 2D overlap, not 3D accuracy. Nothing here has been validated on real clinical radiographs. Do not use it for diagnosis, treatment or surgical planning.
+- **Learned network** (default when its checkpoints are present): a multi-view network trained on simulated X-rays of 101 HFValid CT femurs. Takes one AP view and, optionally, one lateral view.
+- **Shape-model fit**: a CT-trained statistical shape model (SSM) fitted to one AP outline.
+
+> **Research estimate, not a measurement.** Neither method has been validated on real clinical radiographs, and the network was trained only on simulated X-rays. Size comes from the training population, not from your image. Silhouette agreement is 2D overlap, not 3D accuracy. Do not use it for diagnosis, treatment or surgical planning.
 
 ## Quick start
 
 ```bash
-pip install -r requirements-app.txt   # install a CUDA build of torch first for GPU fitting
-python serve.py --demo                # try the UI with a SYNTHETIC demo model
-python serve.py                       # use the real model at models/ssm_highres.npz
+pip install -r requirements-app.txt   # install a CUDA build of torch first for GPU inference
+python serve.py --demo                # try the UI with SYNTHETIC demo models (trains a tiny demo network once, a few minutes on CPU)
+python serve.py                       # use the trained models in models/ (see below)
 ```
+
+`python serve.py` looks for:
+
+| File | Used by | Where it comes from |
+|---|---|---|
+| `models/multiview_ap_lat_d2.pt` | network, AP + lateral | `scripts/run_retraining.py` (or `bash scripts/train_wsl.sh`) |
+| `models/multiview_ap_d2.pt` | network, AP only | same run with `--also-ap` |
+| `models/ssm_sdf.npz` | network, only for checkpoints saved before the mean silhouettes were stored in them | `scripts/build_ssm_sdf.py` (step `ssm` of the same run) |
+| `models/ssm_highres.npz` | shape-model fit | `scripts/build_ssm_v2.py` |
+
+Either method works on its own; the UI greys out whichever is missing. To try a different network, point the server at its checkpoints without touching code: `python serve.py --net-ap-lat path/to/new_ap_lat.pt --net-ap path/to/new_ap.pt` (or set `BONEVISION_NET_AP_LAT` / `BONEVISION_NET_AP`). `--device cuda` runs on the GPU.
 
 Open <http://127.0.0.1:8000>. On Windows use the same commands with your environment's `python`.
 
@@ -20,11 +34,11 @@ Open <http://127.0.0.1:8000>. On Windows use the same commands with your environ
 
 | Page | What it shows |
 |---|---|
-| **Case** | Upload (PNG, JPEG, TIFF, DICOM; drag and drop works anywhere), a draggable frame, live mask preview with contrast/threshold controls, input-quality checks, and fit settings: effort, shape spread, DICOM-spacing sizing with a magnification factor, and the prior weight. |
-| **Inferences** | Your X-ray with the traced mask and the fitted outline mapped back onto it; the canonical-frame overlap; silhouette agreement, orientation, shape typicality and assumed length (each with its meaning stated); per-case flags; the 4 orientation hypotheses; the optimization trace; shape-mode coefficients; shape spread by region; segmentation, standardization and model details. |
+| **Case** | Model choice (learned network or shape-model fit). With the network, an **AP** and an optional **Lateral** tab, each with its own upload, frame and mask settings. Upload (PNG, JPEG, TIFF, DICOM; drag and drop works anywhere), a draggable frame, live mask preview with contrast/threshold controls, and input-quality checks. The shape-model fit adds its settings: effort, shape spread, DICOM-spacing sizing with a magnification factor, and the prior weight. |
+| **Inferences** | Network: each view with its mask and the estimate's outline mapped back, every view on the network grid, per-view agreement and orientation choice, the checkpoint's validation Dice, and flags. Shape-model fit: your X-ray with the traced mask and the fitted outline mapped back onto it; the canonical-frame overlap; silhouette agreement, orientation, shape typicality and assumed length (each with its meaning stated); per-case flags; the 4 orientation hypotheses; the optimization trace; shape-mode coefficients; shape spread by region; segmentation, standardization and model details. |
 | **3D model** | An orbitable surface with solid, wireframe and X-ray (fresnel) modes; colouring by shape spread; an overlay of the population mean; AP, lateral, axial and oblique cameras; extents; and screenshots. Without a case it shows the mean shape. |
-| **Export** | STL (for Slicer), OBJ, a colour PLY carrying the spread values, `report.json`, overlay images and the mask, individually or as one ZIP; Slicer steps and the coordinate frame. |
-| **Method** | How the estimate is made, what it is and is not, the reported synthetic evidence with its caveats, and data licences. |
+| **Export** | Network: `femur_reconstruction.stl` and `femur_labelmap.nrrd` (both tagged RAS so they load unchanged and overlap in Slicer), OBJ, `reconstruction.json` and the overlays; the ZIP includes `BoneVisionLoader.py`, so `Slicer --python-script BoneVisionLoader.py` in the unzipped folder opens everything. Shape-model fit: STL, OBJ, a colour PLY carrying the spread values, `report.json`, overlay images and the mask. Slicer steps and the coordinate frame for both. |
+| **Method** | How each method works, what it is and is not, the reported synthetic evidence with its caveats, and data licences. |
 
 Uploads and results are held **in server memory only**: images are never written to disk, and everything is discarded when the server stops. The server binds to `127.0.0.1` by default. The API is documented at `/api/docs`.
 
@@ -36,7 +50,24 @@ python scripts/reconstruct_single_xray.py femur.png --output runs/case01 [--crop
 
 This writes the same seven files as the web export. It refuses to overwrite existing outputs unless you pass `--force-overwrite`.
 
-## How the pipeline works (`bonevision/pipeline.py`)
+## How the network path works (`bonevision/network.py`)
+
+The network is `scripts/multiview_net.py` (2D encoder per view, back-projection, 3D decoder). It was trained by `scripts/run_retraining.py` on grid-aligned synthetic DRRs, with every right femur mirrored onto the left. For an upload, `scripts/multiview_net_backend.py`:
+
+1. **Traces** each view with the same threshold segmentation as the shape-model path.
+2. **Places** it on the training grid: the mask's principal axis is matched to the mean training silhouette, its proximal end goes to the femoral head, its length is scaled to the mean training femur, and it is centred across the shaft.
+3. **Picks the orientation**: head up or down, mirrored or not. The placement whose outline best matches the mean training femur wins; a small margin raises a flag.
+4. **Runs the network once** (the AP + lateral checkpoint when a lateral view is given, else the AP-only one), keeps the largest solid component, and extracts the surface.
+
+Held-out synthetic test (16 HFValid subjects): AP + lateral Dice 0.943, 0.95 mm mean surface distance; AP only 0.865, 2.19 mm (old SSM fit 0.687, 4.73 mm). These inputs were simulated and already grid-aligned at true length, so expect less on real radiographs. The output is always a left femur at the training-mean length. Views must be true AP and lateral of the same femur.
+
+### Adding a new model or more data
+
+- **Retrain with more data:** import extra femurs as training-only shapes with `scripts/import_external_femurs.py` (TotalSegmentator, VSD, NMDID), then rerun `bash scripts/train_wsl.sh` (or `python scripts/run_retraining.py --also-ap`). Keep the HFValid validation/test split fixed so new numbers compare with the ones above.
+- **Swap checkpoints:** save each run under its own name with its `models/retraining_report.md`, and start the server with `--net-ap-lat` / `--net-ap`. Nothing else changes.
+- **A different kind of model:** add a module like `bonevision/network.py` that returns the same result keys, and a branch for it in `bonevision/server.py` (`create_case` and `_run_case`) and `bonevision/exports.py`.
+
+## How the shape-model pipeline works (`bonevision/pipeline.py`)
 
 1. **Trace**: Otsu threshold, morphology, and an elongation/area/border score select one bone-like region. This is classical image processing, not a learned segmenter.
 2. **Standardize**: the outline is rotated to its principal axis (a rotation, never a reflection) and converted to the model's millimetre grid. Without calibration it is sized to the population-mean length.
@@ -91,6 +122,7 @@ For research scripts, install `requirements-research.txt`. Colab works if you st
 
 ```
 serve.py                     start the web app
+bonevision/network.py        learned-network path (wraps scripts/multiview_net_backend.py)
 bonevision/pipeline.py       read, segment, standardize, fit, surface, overlay
 bonevision/exports.py        STL / OBJ / PLY / PNG / JSON report / ZIP (bytes, no disk I/O)
 bonevision/server.py         FastAPI backend (in-memory uploads and cases)
@@ -98,7 +130,11 @@ web/                         frontend (vanilla JS + vendored three.js and fonts;
 scripts/reconstruct_single_xray.py   CLI over the package
 scripts/evaluate_single_view.py      held-out synthetic evaluation (ideal / app modes)
 scripts/build_ssm_v2.py, build_highres_targets.py   model training
-scripts/make_demo_model.py           synthetic demo model for UI testing
+scripts/make_demo_model.py           synthetic demo shape model for UI testing
+scripts/make_demo_network.py         synthetic demo networks for UI testing
+scripts/run_retraining.py, train_wsl.sh   one-command network retraining (docs/retraining-plan.md)
+scripts/multiview_net*.py, train_multiview_net.py, build_biplanar_dataset.py   the network and its data
+slicer/BoneVisionLoader/     3D Slicer loader for exported folders
 scripts/*drr*, *retrieval*, *mesh*   CT/DRR/multiview research scripts; several are one-off
                                      Pat001 explorations with hard-coded paths
 docs/multiview-reconstruction-audit.md

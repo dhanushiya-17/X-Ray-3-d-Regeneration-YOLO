@@ -56,3 +56,4 @@ models/*.pt
 logs/
 data/femur_sides.csv
 models/*.md
+models/demo/

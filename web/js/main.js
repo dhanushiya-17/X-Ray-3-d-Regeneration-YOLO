@@ -9,15 +9,28 @@ const PAGES = [
   { id: "method", label: "Method", icon: icon.book, tag: "THE METHOD" },
 ];
 const ITERATIONS = [{ v: 120, label: "Fast" }, { v: 250, label: "Standard" }, { v: 500, label: "Thorough" }];
-const STAGES = { queued: "Queued", "loading model": "Loading shape model", segmenting: "Tracing the bone", fitting: "Fitting the shape prior", surface: "Extracting the surface", spread: "Sampling shape spread", "writing exports": "Writing exports" };
+const STAGES = { queued: "Queued", "loading model": "Loading shape model", segmenting: "Tracing the bone", fitting: "Fitting the shape prior", network: "Running the network", surface: "Extracting the surface", spread: "Sampling shape spread", "writing exports": "Writing exports" };
+const VIEWS = { ap: "AP view", lat: "Lateral view" };
+const METHODS = {
+  network: { label: "Learned network", note: "AP + optional lateral" },
+  ssm: { label: "Shape-model fit", note: "one AP view" },
+};
+
+// Each view slot holds one upload with its own frame and mask settings. The
+// shape-model fit only uses the AP slot.
+const blankSlot = () => ({ upload: null, seg: null, segError: null, segBusy: false, crop: { top: 0, bottom: 0, left: 0, right: 0 }, polarity: "auto", threshold_bias: 0 });
 
 const S = {
-  status: null, upload: null, seg: null, segError: null, segBusy: false, showOverlay: true,
-  crop: { top: 0, bottom: 0, left: 0, right: 0 },
-  settings: { polarity: "auto", threshold_bias: 0, iterations: 250, prior_weight: 0.02, use_dicom_spacing: false, magnification: 1.0, spread: true },
+  status: null, showOverlay: true, method: "ssm", active: "ap",
+  slots: { ap: blankSlot(), lat: blankSlot() },
+  settings: { iterations: 250, prior_weight: 0.02, use_dicom_spacing: false, magnification: 1.0, spread: true },
   caseId: null, case: null, mesh: null, meanMesh: null, poll: null, route: "case",
   view: { mode: "solid", colorBy: "bone", ghost: false },
 };
+const slot = (key = S.active) => S.slots[key];
+const usedViews = () => (S.method === "network" ? ["ap", "lat"] : ["ap"]);
+const anyUpload = () => usedViews().some((k) => S.slots[k].upload);
+const methodOk = (m = S.method) => !!S.status?.methods?.[m]?.available;
 
 const $ = (sel, root = document) => root.querySelector(sel);
 const view = $("#view");
@@ -59,12 +72,17 @@ async function loadStatus() {
     return;
   }
   const st = S.status;
-  if (!st.model_available) {
+  S.method = st.default_method || "ssm";
+  const net = st.methods?.network;
+  const demo = (st.model_available && st.model?.synthetic_demo) || (net?.available && net.synthetic_demo);
+  if (!st.model_available && !net?.available) {
     setEngine("err", "No model");
-    showBanner(`No shape model found (${esc(st.model_file)}). Build it with <code>scripts/build_ssm_v2.py</code>, or try the interface with <code>python serve.py --demo</code>.`, "err");
+    showBanner(`No model found. Put the trained network at <code>models/multiview_ap_lat_d2.pt</code> (and <code>models/multiview_ap_d2.pt</code>), build the shape model with <code>scripts/build_ssm_v2.py</code>, or try the interface with <code>python serve.py --demo</code>.`, "err");
   } else {
-    setEngine(st.model.synthetic_demo ? "warn" : "ok", st.cuda_available ? `CUDA · ${st.cuda_device || "GPU"}` : "CPU · local");
-    if (st.model.synthetic_demo) showBanner("Demo model: procedural synthetic shapes, not anatomy. Use it to try the interface only.");
+    setEngine(demo ? "warn" : "ok", st.cuda_available ? `CUDA · ${st.cuda_device || "GPU"}` : "CPU · local");
+    if (demo) showBanner("Demo models: procedural synthetic shapes, not anatomy. Use them to try the interface only.");
+  }
+  if (st.model_available) {
     try {
       S.meanMesh = await api("/api/model/mean-mesh");
       if (stage && !S.mesh) stage.setMesh(S.meanMesh, { kind: "mean", animate: false });
@@ -117,7 +135,7 @@ function renderPage() {
   document.body.dataset.stage = r === "model" ? "full" : r === "case" ? "soft" : "dim";
   document.body.dataset.route = r;
   requestAnimationFrame(() => stage?._resize());
-  document.body.dataset.hero = r === "case" && !S.upload && !running() ? "1" : "0";
+  document.body.dataset.hero = r === "case" && !anyUpload() && !running() ? "1" : "0";
   $(".dock .pill-group").hidden = !(r === "case" || r === "model");
   const renderers = { case: renderCase, inferences: renderInferences, model: renderModel, export: renderExport, method: renderMethod };
   renderers[r]();
@@ -131,10 +149,10 @@ function updateDock() {
   let label, ico = icon.arrow, disabled = false;
   if (S.route === "case") {
     if (running()) { label = "Cancel estimate"; ico = icon.stop; dockAction = cancelCase; }
-    else if (!S.upload) { label = "Upload X-ray"; ico = icon.upload; dockAction = () => $("#file-input").click(); }
+    else if (!slot("ap").upload) { label = "Upload AP X-ray"; ico = icon.upload; dockAction = () => { S.active = "ap"; $("#file-input").click(); }; }
     else {
       label = "Estimate 3D femur"; dockAction = startCase;
-      disabled = !S.status?.model_available || !S.seg || S.segBusy || !!S.segError;
+      disabled = !methodOk() || usedViews().some((k) => { const v = S.slots[k]; return v.upload && (!v.seg || v.segBusy || !!v.segError); });
     }
   } else if (S.route === "inferences") { label = hasResult() ? "Open 3D model" : "Start a case"; dockAction = () => go(hasResult() ? "model" : "case"); }
   else if (S.route === "model") { label = hasResult() ? "Export files" : "Start a case"; ico = hasResult() ? icon.download : icon.arrow; dockAction = () => go(hasResult() ? "export" : "case"); }
@@ -144,7 +162,7 @@ function updateDock() {
   } else { label = "Start a case"; dockAction = () => go("case"); }
   cta.innerHTML = `${ico}<span>${label}</span>`;
   cta.disabled = disabled;
-  cta.title = disabled && S.route === "case" && !S.status?.model_available ? "No shape model is loaded" : "";
+  cta.title = disabled && S.route === "case" && !methodOk() ? `${METHODS[S.method].label} is not available` : "";
 }
 
 function syncDockToggles() {
@@ -183,18 +201,21 @@ function setupFileInput() {
 
 async function loadFile(file) {
   if (running()) { toast("Wait for the current estimate to finish, or cancel it.", "err"); return; }
+  if (S.method !== "network") S.active = "ap";
+  const key = S.active;
   const fd = new FormData();
   fd.append("file", file);
   toast(`Reading ${file.name}…`);
   try {
     const up = await api("/api/uploads", { method: "POST", body: fd });
-    S.upload = { ...up, name: file.name };
-    S.crop = { top: 0, bottom: 0, left: 0, right: 0 };
-    S.seg = null; S.segError = null; S.showOverlay = true;
-    S.settings.use_dicom_spacing = false;
+    const old = S.slots[key].upload;
+    if (old) api(`/api/uploads/${old.id}`, { method: "DELETE" }).catch(() => {});
+    S.slots[key] = { ...blankSlot(), upload: { ...up, name: file.name } };
+    S.active = key; S.showOverlay = true;
+    if (key === "ap") S.settings.use_dicom_spacing = false;
     clearCase();
     if (S.route !== "case") go("case"); else renderPage();
-    runSegment();
+    runSegment(key);
   } catch (err) {
     toast(err.message, "err");
   }
@@ -209,57 +230,101 @@ function clearCase() {
 
 function newCase() {
   if (running()) cancelCase();
-  if (S.upload) api(`/api/uploads/${S.upload.id}`, { method: "DELETE" }).catch(() => {});
-  S.upload = null; S.seg = null; S.segError = null;
+  Object.values(S.slots).forEach((v) => { if (v.upload) api(`/api/uploads/${v.upload.id}`, { method: "DELETE" }).catch(() => {}); });
+  S.slots = { ap: blankSlot(), lat: blankSlot() }; S.active = "ap";
   clearCase();
   go("case");
   renderPage();
 }
 
 // ---------------------------------------------------------------- segmentation
-async function runSegment() {
-  if (!S.upload) return;
-  S.segBusy = true; updateSegUI();
-  const token = Symbol("seg"); runSegment.token = token;
+async function runSegment(key = S.active) {
+  const v = S.slots[key];
+  if (!v.upload) return;
+  v.segBusy = true; updateSegUI();
+  const token = Symbol("seg"); v.token = token;
   try {
-    const res = await api(`/api/uploads/${S.upload.id}/segment`, { json: { crop: S.crop, polarity: S.settings.polarity, threshold_bias: S.settings.threshold_bias } });
-    if (runSegment.token !== token) return;
-    S.seg = res; S.segError = null;
+    const res = await api(`/api/uploads/${v.upload.id}/segment`, { json: { crop: v.crop, polarity: v.polarity, threshold_bias: v.threshold_bias } });
+    if (v.token !== token) return;
+    v.seg = res; v.segError = null;
   } catch (err) {
-    if (runSegment.token !== token) return;
-    S.seg = null; S.segError = err.message;
-    if (err.status === 404) { toast("This upload expired from server memory. Please load the image again.", "err"); S.upload = null; renderPage(); return; }
+    if (v.token !== token) return;
+    v.seg = null; v.segError = err.message;
+    if (err.status === 404) { toast("This upload expired from server memory. Please load the image again.", "err"); S.slots[key] = blankSlot(); renderPage(); return; }
   } finally {
-    if (runSegment.token === token) { S.segBusy = false; updateSegUI(); updateDock(); }
+    if (v.token === token) { v.segBusy = false; updateSegUI(); updateDock(); updateViewTabs(); }
   }
 }
-const runSegmentSoon = debounce(runSegment, 260);
+const runSegmentSoon = debounce(() => runSegment(), 260);
 
 // ------------------------------------------------------------------ case page
+function methodStep() {
+  const ms = S.status?.methods || {};
+  const net = ms.network;
+  const latOk = net?.lateral_supported;
+  return `<div class="step">
+        <h2 class="step-title"><b>00</b>Reconstruction model</h2>
+        <div class="seg" role="radiogroup" aria-label="Reconstruction model">
+          ${Object.entries(METHODS).map(([k, m]) => `<input type="radio" name="method" id="m-${k}" value="${k}" ${S.method === k ? "checked" : ""} ${ms[k]?.available ? "" : "disabled"}><label for="m-${k}" ${ms[k]?.available ? "" : 'style="opacity:.45" title="' + esc(ms[k]?.problem || "Not available") + '"'}>${m.label}</label>`).join("")}
+        </div>
+        <p class="tiny faint" style="margin:8px 0 0">${S.method === "network"
+          ? `Trained on simulated X-rays of 101 CT femurs. Upload one AP view${latOk ? " and, for better depth, one lateral view" : " (no lateral checkpoint found, so AP only)"}.`
+          : "Fits a statistical shape model to one AP outline. Depth comes from the population prior."}</p>
+        ${S.method === "network" ? `<div class="seg" role="tablist" aria-label="Views" id="view-tabs" style="margin-top:12px">${viewTabs()}</div>` : ""}
+      </div>`;
+}
+
+function viewTabs() {
+  const latOk = S.status?.methods?.network?.lateral_supported;
+  return ["ap", "lat"].map((k) => {
+    const v = S.slots[k];
+    const state = v.segError ? " ⚠" : v.upload ? (v.seg ? " ✓" : " …") : k === "lat" ? " (optional)" : "";
+    const off = k === "lat" && !latOk;
+    return `<input type="radio" name="vtab" id="vt-${k}" value="${k}" ${S.active === k ? "checked" : ""} ${off ? "disabled" : ""}><label for="vt-${k}" ${off ? 'style="opacity:.45"' : ""}>${VIEWS[k]}${state}</label>`;
+  }).join("");
+}
+
+function updateViewTabs() {
+  const el = $("#view-tabs");
+  if (!el) return;
+  el.innerHTML = viewTabs();
+  bindViewTabs();
+}
+
+function bindViewTabs() {
+  view.querySelectorAll('input[name="vtab"]').forEach((i) => i.addEventListener("change", () => { S.active = i.value; renderPage(); }));
+}
+
 function renderCase() {
-  if (!S.upload && !running()) return renderHero();
-  const up = S.upload;
+  if (!anyUpload() && !running()) return renderHero();
+  if (S.method !== "network") S.active = "ap";
+  const v = slot();
+  const up = v.upload;
   const meta = up?.meta || {};
   const spacing = meta.pixel_spacing_mm;
+  const network = S.method === "network";
   view.innerHTML = `
   <section class="workspace" aria-label="Prepare the X-ray">
     <div class="panel scroll" id="prep">
-      <div class="step">
+      ${methodStep()}
+      ${up ? `<div class="step">
         <div class="file-card">
-          <div class="thumb" style="background-image:url('${up?.preview || ""}')"></div>
+          <div class="thumb" style="background-image:url('${up.preview || ""}')"></div>
           <div style="min-width:0;flex:1">
-            <div class="name" title="${esc(up?.name)}">${esc(up?.name || S.case?.name || "Case")}</div>
+            <div class="name" title="${esc(up.name)}">${network ? `<span class="faint">${VIEWS[S.active]} · </span>` : ""}${esc(up.name || S.case?.name || "Case")}</div>
             <div class="small faint num">${esc(meta.format || "")} · ${meta.shape ? `${meta.shape[1]}×${meta.shape[0]} px` : ""}${spacing ? ` · ${fmt(spacing[0], 3)} mm/px` : ""}</div>
           </div>
           <button class="link-btn" type="button" id="replace">Replace</button>
+          ${network && S.active === "lat" ? '<button class="link-btn" type="button" id="remove-view">Remove</button>' : ""}
         </div>
-        ${alerts(up?.warnings)}
-      </div>
-      <div class="step">
+        ${alerts(up.warnings)}
+      </div>` : `<div class="step"><p class="small muted" style="margin:0 0 12px">${network && S.active === "lat" ? "A lateral view of the same femur, taken at 90° to the AP, lets the network see depth instead of guessing it." : "Upload the AP view first."}</p>
+        <button class="pill pill-ice" type="button" id="add-view">${icon.upload}<span>Upload ${VIEWS[S.active].toLowerCase()}</span></button></div>`}
+      ${up ? `<div class="step">
         <h2 class="step-title"><b>01</b>Frame one femur</h2>
         <p class="small muted" style="margin:0">Drag the box on the image so it holds a single, full-length femur. Hardware and the other leg confuse the threshold.</p>
         <details class="more"><summary>Exact margins</summary>
-          <div class="crop-grid">${["top", "bottom", "left", "right"].map((k) => `<label>${k[0].toUpperCase() + k.slice(1)} %<input class="num-input" type="number" min="0" max="45" step="1" data-crop="${k}" value="${Math.round(S.crop[k] * 100)}"></label>`).join("")}</div>
+          <div class="crop-grid">${["top", "bottom", "left", "right"].map((k) => `<label>${k[0].toUpperCase() + k.slice(1)} %<input class="num-input" type="number" min="0" max="45" step="1" data-crop="${k}" value="${Math.round(v.crop[k] * 100)}"></label>`).join("")}</div>
           <button class="link-btn" type="button" id="reset-crop" style="margin-top:8px">Reset frame</button>
         </details>
       </div>
@@ -267,17 +332,24 @@ function renderCase() {
         <h2 class="step-title"><b>02</b>Trace the bone</h2>
         <div class="field"><span class="label" id="pol-l">Bone contrast</span>
           <div class="seg" role="radiogroup" aria-labelledby="pol-l">
-            ${[["auto", "Auto"], ["bright", "Bright bone"], ["dark", "Dark bone"]].map(([v, l]) => `<input type="radio" name="polarity" id="pol-${v}" value="${v}" ${S.settings.polarity === v ? "checked" : ""}><label for="pol-${v}">${l}</label>`).join("")}
+            ${[["auto", "Auto"], ["bright", "Bright bone"], ["dark", "Dark bone"]].map(([k, l]) => `<input type="radio" name="polarity" id="pol-${k}" value="${k}" ${v.polarity === k ? "checked" : ""}><label for="pol-${k}">${l}</label>`).join("")}
           </div>
         </div>
         <div class="field">
-          <div class="field-row"><label for="thr">Threshold offset</label><span class="small num" id="thr-v">${fmt(S.settings.threshold_bias, 2)}</span></div>
-          <input id="thr" type="range" min="-0.2" max="0.2" step="0.01" value="${S.settings.threshold_bias}">
+          <div class="field-row"><label for="thr">Threshold offset</label><span class="small num" id="thr-v">${fmt(v.threshold_bias, 2)}</span></div>
+          <input id="thr" type="range" min="-0.2" max="0.2" step="0.01" value="${v.threshold_bias}">
         </div>
         <div id="seg-summary" class="small muted" style="margin-top:12px"></div>
         <div id="seg-alerts"></div>
-      </div>
-      <div class="step">
+      </div>` : ""}
+      ${network ? `<div class="step">
+        <h2 class="step-title"><b>03</b>What the network assumes</h2>
+        <ul class="list small muted" style="margin:0">
+          <li>Each view is a true AP or true lateral of the same femur.</li>
+          <li>Femur length is set to the training mean; the image carries no scale.</li>
+          <li>Right legs are mirrored, so the result is shown as a left femur.</li>
+        </ul>
+      </div>` : `<div class="step">
         <h2 class="step-title"><b>03</b>Fit settings</h2>
         <div class="field"><span class="label" id="it-l">Fit effort</span>
           <div class="seg" role="radiogroup" aria-labelledby="it-l">
@@ -293,12 +365,12 @@ function renderCase() {
           <input id="prior" type="range" min="0" max="0.2" step="0.005" value="${S.settings.prior_weight}">
           <p class="tiny faint" style="margin:0">0.020 is the evaluated default. Lower values follow the outline more closely and allow less typical shapes; nothing else has been validated.</p></div>
         </details>
-      </div>
+      </div>`}
       <div class="step" id="case-error"></div>
     </div>
     <div class="spacer" aria-hidden="true"></div>
-    <div class="panel" id="imgpanel" style="display:flex;flex-direction:column;align-self:start;max-height:100%">
-      <div class="panel-head"><span class="eyebrow muted">X-ray</span>
+    <div class="panel" id="imgpanel" style="display:flex;flex-direction:column;align-self:start;max-height:100%" ${up ? "" : "hidden"}>
+      <div class="panel-head"><span class="eyebrow muted">${network ? VIEWS[S.active] : "X-ray"}</span>
         <div class="seg" role="radiogroup" aria-label="Image layer" style="min-width:210px">
           <input type="radio" name="layer" id="ly-mask" value="mask" ${S.showOverlay ? "checked" : ""}><label for="ly-mask">Mask</label>
           <input type="radio" name="layer" id="ly-orig" value="orig" ${S.showOverlay ? "" : "checked"}><label for="ly-orig">Original</label>
@@ -320,11 +392,13 @@ function renderHero() {
   view.innerHTML = `
   <section class="hero" aria-label="Start">
     <div class="hero-left">
-      <div class="eyebrow">Single-view femur shape estimation</div>
-      <h1 class="display">One view.<br>A shape within.</h1>
-      <p class="lede">Upload one AP femur radiograph. BoneVision traces the bone, fits a CT-trained shape prior and returns a surface you can orbit and open in 3D Slicer. <span>A research estimate, not a measurement.</span></p>
+      <div class="eyebrow">${S.method === "network" ? "Femur reconstruction from X-rays" : "Single-view femur shape estimation"}</div>
+      <h1 class="display">${S.method === "network" ? "Two views.<br>One femur." : "One view.<br>A shape within."}</h1>
+      <p class="lede">${S.method === "network"
+        ? "Upload an AP femur radiograph, and a lateral one if you have it. BoneVision traces the bone, runs a network trained on CT-derived X-rays and returns a surface you can orbit and open in 3D Slicer."
+        : "Upload one AP femur radiograph. BoneVision traces the bone, fits a CT-trained shape prior and returns a surface you can orbit and open in 3D Slicer."} <span>A research estimate, not a measurement.</span></p>
       <div class="dropzone">
-        <button class="pill pill-ice pill-lg" type="button" id="hero-upload">${icon.upload}<span>Choose an X-ray</span></button>
+        <button class="pill pill-ice pill-lg" type="button" id="hero-upload">${icon.upload}<span>${S.method === "network" ? "Choose the AP X-ray" : "Choose an X-ray"}</span></button>
         <div class="formats" aria-label="Accepted formats"><span class="chip">PNG</span><span class="chip">JPEG</span><span class="chip">TIFF</span><span class="chip">DICOM</span></div>
       </div>
       <p class="small faint" style="margin-top:18px">or drop a file anywhere. Images stay in this computer's memory and are never written to disk.</p>
@@ -332,25 +406,33 @@ function renderHero() {
     </div>
     <div class="hero-right" aria-hidden="true">
       <span class="serif">Inferred,<br>not measured.</span>
-      <span class="eyebrow">${st?.model?.synthetic_demo ? `Depth from a ${n}-shape synthetic demo prior.` : n ? `Depth from a ${n}-shape CT prior.` : "Depth from a CT shape prior."}<br>Exported for 3D Slicer.</span>
+      <span class="eyebrow">${S.method === "network" ? (st?.methods?.network?.synthetic_demo ? "Synthetic demo network." : "Network trained on 101 CT femurs.") : st?.model?.synthetic_demo ? `Depth from a ${n}-shape synthetic demo prior.` : n ? `Depth from a ${n}-shape CT prior.` : "Depth from a CT shape prior."}<br>Exported for 3D Slicer.</span>
     </div>
   </section>
   <p class="hero-caption">${S.mesh ? "Latest estimate" : st?.model_available ? "Population mean shape · drag to orbit" : ""}</p>`;
-  $("#hero-upload").addEventListener("click", () => $("#file-input").click());
+  $("#hero-upload").addEventListener("click", () => { S.active = "ap"; $("#file-input").click(); });
   api("/api/cases").then((list) => {
     const done = list.filter((c) => c.status === "done");
     if (!done.length) return;
-    $("#recent").innerHTML = `<div class="eyebrow muted" style="margin:34px 0 10px">This session</div><div class="formats">${done.slice(0, 4).map((c) => `<button class="pill pill-sm" type="button" data-case="${c.id}">${esc(c.name)} · ${fmt(c.silhouette_soft_dice, 2)}</button>`).join("")}</div>`;
+    $("#recent").innerHTML = `<div class="eyebrow muted" style="margin:34px 0 10px">This session</div><div class="formats">${done.slice(0, 4).map((c) => `<button class="pill pill-sm" type="button" data-case="${c.id}">${esc(c.name)} · ${c.method === "network" ? "network" : "SSM"} · ${fmt(c.silhouette_soft_dice, 2)}</button>`).join("")}</div>`;
     $("#recent").querySelectorAll("[data-case]").forEach((b) => b.addEventListener("click", async () => { await restoreCase(b.dataset.case); go("model"); }));
   }).catch(() => {});
 }
 
 function bindCase() {
+  view.querySelectorAll('input[name="method"]').forEach((i) => i.addEventListener("change", () => { S.method = i.value; clearCase(); renderPage(); }));
+  bindViewTabs();
   $("#replace")?.addEventListener("click", () => $("#file-input").click());
-  view.querySelectorAll('input[name="polarity"]').forEach((i) => i.addEventListener("change", () => { S.settings.polarity = i.value; runSegment(); }));
+  $("#add-view")?.addEventListener("click", () => $("#file-input").click());
+  $("#remove-view")?.addEventListener("click", () => {
+    const v = slot();
+    if (v.upload) api(`/api/uploads/${v.upload.id}`, { method: "DELETE" }).catch(() => {});
+    S.slots[S.active] = blankSlot(); clearCase(); renderPage();
+  });
+  view.querySelectorAll('input[name="polarity"]').forEach((i) => i.addEventListener("change", () => { slot().polarity = i.value; runSegment(); }));
   const thr = $("#thr");
   const paintRange = (el) => el.style.setProperty("--p", `${((el.value - el.min) / (el.max - el.min)) * 100}%`);
-  if (thr) { paintRange(thr); thr.addEventListener("input", () => { S.settings.threshold_bias = Number(thr.value); $("#thr-v").textContent = fmt(thr.value, 2); paintRange(thr); runSegmentSoon(); }); }
+  if (thr) { paintRange(thr); thr.addEventListener("input", () => { slot().threshold_bias = Number(thr.value); $("#thr-v").textContent = fmt(thr.value, 2); paintRange(thr); runSegmentSoon(); }); }
   const prior = $("#prior");
   if (prior) { paintRange(prior); prior.addEventListener("input", () => { S.settings.prior_weight = Number(prior.value); $("#prior-v").textContent = fmt(prior.value, 3); paintRange(prior); }); }
   view.querySelectorAll('input[name="iters"]').forEach((i) => i.addEventListener("change", () => { S.settings.iterations = Number(i.value); }));
@@ -359,46 +441,47 @@ function bindCase() {
   $("#mag")?.addEventListener("change", (e) => { S.settings.magnification = Math.min(1.9, Math.max(0.6, Number(e.target.value) || 1)); e.target.value = S.settings.magnification; });
   view.querySelectorAll('input[name="layer"]').forEach((i) => i.addEventListener("change", () => { S.showOverlay = i.value === "mask"; updateSegUI(); }));
   view.querySelectorAll("[data-crop]").forEach((inp) => inp.addEventListener("change", () => {
-    const k = inp.dataset.crop;
-    S.crop[k] = Math.min(45, Math.max(0, Number(inp.value) || 0)) / 100;
-    inp.value = Math.round(S.crop[k] * 100);
+    const k = inp.dataset.crop, crop = slot().crop;
+    crop[k] = Math.min(45, Math.max(0, Number(inp.value) || 0)) / 100;
+    inp.value = Math.round(crop[k] * 100);
     placeCropRect(); runSegment();
   }));
-  $("#reset-crop")?.addEventListener("click", () => { S.crop = { top: 0, bottom: 0, left: 0, right: 0 }; syncCropInputs(); placeCropRect(); runSegment(); });
+  $("#reset-crop")?.addEventListener("click", () => { slot().crop = { top: 0, bottom: 0, left: 0, right: 0 }; syncCropInputs(); placeCropRect(); runSegment(); });
 }
 
 function syncCropInputs() {
-  view.querySelectorAll("[data-crop]").forEach((inp) => { inp.value = Math.round(S.crop[inp.dataset.crop] * 100); });
+  view.querySelectorAll("[data-crop]").forEach((inp) => { inp.value = Math.round(slot().crop[inp.dataset.crop] * 100); });
 }
 
 function updateSegUI() {
   const box = $("#imgbox");
-  if (!box || !S.upload) return;
-  const [h, w] = S.upload.meta.shape;
-  const src = S.showOverlay && S.seg ? S.seg.overlay : S.upload.preview;
+  const v = slot();
+  if (!box || !v.upload) return;
+  const [h, w] = v.upload.meta.shape;
+  const src = S.showOverlay && v.seg ? v.seg.overlay : v.upload.preview;
   const maxH = Math.max(260, window.innerHeight - 330);
   box.innerHTML = `<div style="position:relative;width:min(100%, ${(maxH * w) / h}px);aspect-ratio:${w}/${h}">
       <img src="${src}" alt="${S.showOverlay ? "X-ray with the selected bone region highlighted" : "Uploaded X-ray"}" style="width:100%;height:100%;max-height:none">
       <div class="crop-layer" id="crop-layer" style="inset:0"><div class="crop-rect" id="crop-rect" tabindex="0" aria-label="Frame. Drag to move; drag corners to resize.">
         <span class="h" data-h="nw"></span><span class="h" data-h="ne"></span><span class="h" data-h="sw"></span><span class="h" data-h="se"></span></div></div>
-    </div>${S.segBusy ? '<span class="busy spinner" role="status" aria-label="Updating mask"></span>' : ""}`;
+    </div>${v.segBusy ? '<span class="busy spinner" role="status" aria-label="Updating mask"></span>' : ""}`;
   placeCropRect();
   bindCrop();
   const sum = $("#seg-summary"), al = $("#seg-alerts");
-  if (S.segError) {
+  if (v.segError) {
     sum.textContent = "";
-    al.innerHTML = alerts([{ level: "error", message: S.segError }]);
-  } else if (S.seg) {
-    const g = S.seg.segmentation;
+    al.innerHTML = alerts([{ level: "error", message: v.segError }]);
+  } else if (v.seg) {
+    const g = v.seg.segmentation;
     sum.innerHTML = `Mask: <b>${esc(g.polarity)}</b> bone · ${fmt(g.component_area_fraction * 100, 1)}% of frame · elongation ${fmt(g.elongation, 1)} · Otsu ${fmt(g.threshold_used, 2)}`;
-    al.innerHTML = alerts(S.seg.warnings);
+    al.innerHTML = alerts(v.seg.warnings);
   }
 }
 
 function placeCropRect() {
   const r = $("#crop-rect");
   if (!r) return;
-  const c = S.crop;
+  const c = slot().crop;
   Object.assign(r.style, { left: `${c.left * 100}%`, top: `${c.top * 100}%`, width: `${(1 - c.left - c.right) * 100}%`, height: `${(1 - c.top - c.bottom) * 100}%` });
 }
 
@@ -410,7 +493,7 @@ function bindCrop() {
   rect.addEventListener("pointerdown", (e) => {
     e.preventDefault();
     rect.setPointerCapture(e.pointerId);
-    drag = { h: e.target.dataset.h || "move", x: e.clientX, y: e.clientY, start: { ...S.crop }, box: layer.getBoundingClientRect() };
+    drag = { h: e.target.dataset.h || "move", x: e.clientX, y: e.clientY, start: { ...slot().crop }, box: layer.getBoundingClientRect() };
   });
   rect.addEventListener("pointermove", (e) => {
     if (!drag) return;
@@ -425,7 +508,7 @@ function bindCrop() {
       if (drag.h.includes("n")) c.top = clamp(s.top + dy);
       if (drag.h.includes("s")) c.bottom = clamp(s.bottom - dy);
     }
-    S.crop = c; placeCropRect();
+    slot().crop = c; placeCropRect();
   });
   const end = () => { if (!drag) return; drag = null; syncCropInputs(); runSegment(); };
   rect.addEventListener("pointerup", end);
@@ -436,20 +519,24 @@ function bindCrop() {
     const m = map[e.key];
     if (!m) return;
     e.preventDefault();
-    const c = { ...S.crop };
+    const c = { ...slot().crop };
     if (c[m[0]] + m[1] < 0 || c[m[2]] + m[3] < 0) return;
     c[m[0]] = clamp(c[m[0]] + m[1]); c[m[2]] = clamp(c[m[2]] + m[3]);
-    S.crop = c; placeCropRect(); syncCropInputs(); runSegmentSoon();
+    slot().crop = c; placeCropRect(); syncCropInputs(); runSegmentSoon();
   });
 }
 
 // ------------------------------------------------------------------ case runs
 async function startCase() {
-  if (!S.upload || running()) return;
+  const ap = slot("ap");
+  if (!ap.upload || running()) return;
+  const body = S.method === "network"
+    ? { method: "network", views: usedViews().filter((k) => S.slots[k].upload).map((k) => { const v = S.slots[k]; return { upload_id: v.upload.id, kind: k, crop: v.crop, polarity: v.polarity, threshold_bias: v.threshold_bias }; }) }
+    : { method: "ssm", upload_id: ap.upload.id, crop: ap.crop, polarity: ap.polarity, threshold_bias: ap.threshold_bias, ...S.settings };
   try {
-    const { id } = await api("/api/cases", { json: { upload_id: S.upload.id, crop: S.crop, ...S.settings } });
+    const { id } = await api("/api/cases", { json: body });
     S.caseId = id;
-    S.case = { id, status: "queued", stage: "queued", iteration: 0, total: S.settings.iterations, live_history: [] };
+    S.case = { id, method: S.method, status: "queued", stage: "queued", iteration: 0, total: S.method === "network" ? 0 : S.settings.iterations, live_history: [] };
     sessionStorage.setItem("bv-case", id);
     renderPage();
     startPolling();
@@ -483,7 +570,7 @@ async function pollCase() {
       S.mesh = await api(`/api/cases/${S.caseId}/mesh`);
       stage?.setMesh(S.mesh, { kind: "result" });
       if (S.view.colorBy === "spread" && !S.mesh.spread) S.view.colorBy = "bone";
-      toast(`Estimate ready · silhouette agreement ${fmt(c.result.silhouette_soft_dice, 2)}`);
+      toast(`Estimate ready · ${c.result.method === "network" ? "view agreement" : "silhouette agreement"} ${fmt(c.result.silhouette_soft_dice, 2)}`);
       go("model");
       renderPage();
     } catch (err) { toast(err.message, "err"); }
@@ -505,6 +592,15 @@ function updateProgress() {
   const c = S.case;
   const pct = c.total ? Math.round((c.iteration / c.total) * 100) : 0;
   const hist = (c.live_history || []).map((p) => p[1]);
+  if (c.method === "network") {
+    host.innerHTML = `<div class="panel progress-card" role="status" aria-live="polite">
+    <div class="eyebrow">${esc(STAGES[c.stage] || c.stage)}</div>
+    <div class="small faint" style="margin-top:8px">Placing each view on the network grid, trying 4 orientations per view, then one network pass.</div>
+    <div class="bar"><i style="width:${{ queued: 5, segmenting: 25, network: 55, surface: 80, "writing exports": 92 }[c.stage] || 10}%"></i></div>
+  </div>`;
+    view.querySelectorAll("#prep input, #prep button").forEach((el) => { el.disabled = true; });
+    return;
+  }
   host.innerHTML = `<div class="panel progress-card" role="status" aria-live="polite">
     <div class="eyebrow">${esc(STAGES[c.stage] || c.stage)}</div>
     <div class="count num">${c.iteration || 0}<small> / ${c.total}</small></div>
@@ -535,8 +631,54 @@ function emptyState(title, body) {
   view.innerHTML = `<section class="page"><div class="empty"><div><div class="eyebrow muted">Nothing here yet</div><h2 class="h2">${title}</h2><p class="muted">${body}</p><a class="pill pill-ice pill-lg" href="#/case">${icon.upload}<span>Start with an X-ray</span></a></div></div></section>`;
 }
 
+function renderNetworkInferences() {
+  const r = S.case.result, id = S.caseId;
+  const val = r.checkpoint_validation || {};
+  view.innerHTML = `
+  <section class="page" aria-labelledby="inf-h">
+    <header class="page-head">
+      <div><div class="eyebrow">02 · Inferences</div><h1 class="h2" id="inf-h">What the network saw, <em>and what it assumed.</em></h1></div>
+      <p class="muted small">Every number here describes this upload. None of them is a 3D accuracy measurement: there is no ground truth for an uploaded X-ray.</p>
+    </header>
+    <div class="grid g4" style="margin-bottom:20px">
+      <div class="card metric"><div class="eyebrow">View agreement</div><div class="value num">${fmt(r.silhouette_soft_dice, 3)}<small> Dice</small></div><p>Mean overlap, across views, of the 3D estimate's silhouette with your traced outline on the network grid. Lowest view ${fmt(r.min_view_dice, 3)}. 2D only.</p></div>
+      <div class="card metric"><div class="eyebrow">Views used</div><div class="value" style="font-size:30px;margin:16px 0 12px">${r.model_views.map((k) => k.toUpperCase()).join(" + ")}</div><p>${r.model_views.includes("lat") ? "The lateral view constrains depth directly." : "AP only: depth comes from what the network learned."}${r.ignored_views.length ? ` Ignored: ${esc(r.ignored_views.join(", "))}.` : ""}</p></div>
+      <div class="card metric"><div class="eyebrow">Checkpoint</div><div class="value num">${val.dice != null ? fmt(val.dice, 3) : "—"}<small> val Dice</small></div><p>${esc(r.checkpoint)}${val.epoch != null ? `, epoch ${val.epoch}` : ""}. Validation on synthetic X-rays at training time${val.synthetic_demo ? " (synthetic demo network)" : ""}.</p></div>
+      <div class="card metric"><div class="eyebrow">Assumed length</div><div class="value num">${fmt(r.dimensions_mm[0], 0)}<small> mm</small></div><p>Not measured: every view is scaled so the femur has the training-mean length. Shown as a ${r.canonical_side === "L" ? "left" : "right"} femur.</p></div>
+    </div>
+    ${r.warnings.length ? `<div class="card flat" style="margin-bottom:20px"><div class="card-title"><h3>Flags for this case</h3><span class="small faint">${r.warnings.length}</span></div>${alerts(r.warnings)}</div>` : ""}
+    <div class="grid g2" style="margin-bottom:20px">
+      ${r.views.map((v) => `<figure class="card" style="margin:0"><div class="card-title"><h3>${esc(VIEWS[v.kind])}</h3><span class="small faint">your X-ray</span></div>
+        <div class="figure"><img src="/api/cases/${id}/files/input_overlay_${v.kind}.png?inline=1" alt="${esc(VIEWS[v.kind])} with the traced mask and the estimate's outline"></div>
+        <figcaption class="legend"><span><i style="background:var(--warm)"></i>Traced bone mask</span><span><i style="background:#8cd9ff"></i>Estimate's outline mapped back</span></figcaption></figure>`).join("")}
+    </div>
+    <div class="grid g2" style="margin-bottom:20px">
+      <figure class="card" style="margin:0"><div class="card-title"><h3>On the network grid</h3><span class="small faint">${r.views.map((v) => VIEWS[v.kind]).join(" · ")}</span></div>
+        <div class="figure" style="display:grid;place-items:center;background:#0e141b"><img class="pixel" style="max-height:520px;width:auto" src="/api/cases/${id}/files/view_fit.png?inline=1" alt="Each view's traced outline against the estimate's silhouette on the network grid"></div>
+        <figcaption class="legend"><span><i style="background:#78c8a0"></i>Both</span><span><i style="background:#ed9e59"></i>Outline only</span><span><i style="background:#78bef5"></i>Estimate only</span></figcaption></figure>
+      <div class="card"><div class="card-title"><h3>Per view</h3><span class="small faint">${r.hypotheses_tested} placements tried</span></div>
+        <table class="data"><thead><tr><th>View</th><th class="num">Dice</th><th class="num">Orientation match</th><th>Placement</th></tr></thead><tbody>
+        ${r.views.map((v) => `<tr><td>${esc(VIEWS[v.kind])}<div class="tiny faint">${esc(v.input.source_name || "")}</div></td><td class="num">${fmt(v.soft_dice, 3)}</td>
+          <td class="num">${fmt(v.orientation_match, 2)} <span class="faint">(+${fmt(v.orientation_margin, 2)})</span></td>
+          <td class="small">${v.flipped_long_axis ? "turned 180°" : "as oriented"}${v.mirrored ? ", mirrored" : ""} · ${fmt(v.assumed_mm_per_pixel, 3)} mm/px</td></tr>`).join("")}
+        </tbody></table>
+        <p class="tiny faint" style="margin:12px 0 0">Each view is placed on the grid in four ways (head up or down, mirrored or not); the placement whose outline best matches the mean training femur is used. A small margin means the choice was close. Mirrored usually means a right leg or a PA image.</p></div>
+    </div>
+    <div class="grid g3">
+      ${r.views.map((v) => `<div class="card"><div class="card-title"><h3>${esc(VIEWS[v.kind])} mask</h3><span class="chip">classical</span></div><dl class="kv">
+        <dt>Polarity</dt><dd>${esc(v.segmentation.polarity)}</dd><dt>Threshold</dt><dd>${fmt(v.segmentation.threshold_used, 3)}</dd>
+        <dt>Region area</dt><dd>${fmt(v.segmentation.component_area_fraction * 100, 1)}%</dd><dt>Elongation</dt><dd>${fmt(v.segmentation.elongation, 1)}</dd>
+        <dt>Touches edge</dt><dd>${v.segmentation.touches_border ? "yes" : "no"}</dd></dl></div>`).join("")}
+      <div class="card"><div class="card-title"><h3>Model &amp; run</h3>${val.synthetic_demo ? '<span class="chip" data-tone="warn">synthetic demo</span>' : ""}</div><dl class="kv">
+        <dt>Network</dt><dd>${esc(r.checkpoint)}</dd><dt>Views</dt><dd>${r.model_views.map((k) => k.toUpperCase()).join(" + ")}</dd>
+        <dt>Grid</dt><dd>${r.grid_shape.join("×")} (÷${r.network_downsample} inside)</dd><dt>Device</dt><dd>${esc(r.device.toUpperCase())}</dd><dt>Run time</dt><dd>${fmt(r.elapsed_seconds, 1)} s</dd></dl></div>
+    </div>
+  </section>`;
+}
+
 function renderInferences() {
-  if (!hasResult()) return emptyState("No estimate <em>yet.</em>", "Inferences appear after a fit: the traced mask, the fitted outline on your X-ray, orientation evidence, optimization trace and shape-mode coefficients.");
+  if (!hasResult()) return emptyState("No estimate <em>yet.</em>", "Inferences appear after a run: the traced masks, the estimate's outline on your X-rays and the checks behind them.");
+  if (S.case.result.method === "network") return renderNetworkInferences();
   const r = S.case.result, id = S.caseId;
   const tf = r.transform, spread = r.spread;
   const best = r.hypotheses[r.hypothesis.index];
@@ -616,7 +758,7 @@ function renderModel() {
     <div class="panel scroll">
       <div class="eyebrow muted">${r ? "Estimated surface" : "Population mean shape"}</div>
       <h1 class="h3" style="margin:8px 0 2px;font-size:22px;font-weight:400">${r ? esc(S.case.name) : "No estimate yet"}</h1>
-      <p class="small faint" style="margin:0 0 6px">${r ? `${S.mesh.face_count.toLocaleString()} triangles · canonical frame, mm` : "Upload an X-ray to fit it."}</p>
+      <p class="small faint" style="margin:0 0 6px">${r ? `${S.mesh.face_count.toLocaleString()} triangles · ${r.method === "network" ? "network estimate, left femur" : "canonical frame"}, mm` : "Upload an X-ray to fit it."}</p>
       <div class="field"><span class="label" id="sf-l">Surface</span><div class="seg" role="radiogroup" aria-labelledby="sf-l">
         ${[["solid", "Solid"], ["wireframe", "Wire"], ["xray", "X-ray"]].map(([v, l]) => `<input type="radio" name="surface" id="sf-${v}" value="${v}" ${S.view.mode === v ? "checked" : ""}><label for="sf-${v}">${l}</label>`).join("")}</div></div>
       <div class="field"><span class="label" id="co-l">Colour</span><div class="seg" role="radiogroup" aria-labelledby="co-l">
@@ -634,7 +776,7 @@ function renderModel() {
         <dt>Mediolateral</dt><dd class="num">${dims ? fmt(dims[1], 1) : "—"} mm</dd>
         <dt>Anteroposterior</dt><dd class="num">${dims ? fmt(dims[2], 1) : "—"} mm</dd>
       </dl>
-      <p class="tiny faint" style="margin:10px 0 0">${r?.transform.calibrated ? "Sized from DICOM spacing; magnification as entered." : "Bounding extents of the estimate. Without calibration the overall size comes from the population prior, not your image."}</p>
+      <p class="tiny faint" style="margin:10px 0 0">${r?.transform?.calibrated ? "Sized from DICOM spacing; magnification as entered." : r?.method === "network" ? "Bounding extents of the estimate. Length is set to the training mean, so overall size is not measured from your images." : "Bounding extents of the estimate. Without calibration the overall size comes from the population prior, not your image."}</p>
       ${hasSpread ? `<div style="margin-top:22px"><div class="eyebrow muted">Shape spread</div><div class="legend-ramp" role="img" aria-label="Colour ramp from agreement to disagreement"></div>
         <div class="field-row tiny faint"><span>0 · agree</span><span>0.25</span><span>0.5 · disagree</span></div>
         <p class="tiny faint" style="margin:8px 0 0">Where silhouette-consistent samples disagree. Heuristic, not a confidence interval.</p></div>` : ""}
@@ -659,6 +801,7 @@ function renderModel() {
 function renderExport() {
   if (!hasResult()) return emptyState("Nothing to <em>export yet.</em>", "After a fit you can download the mesh as STL, OBJ or a colour PLY, plus the JSON report and the overlay images, one at a time or as a single bundle.");
   const r = S.case.result, id = S.caseId;
+  const net = r.method === "network";
   const ico = (n) => (n.endsWith(".png") ? icon.image : n.endsWith(".json") ? icon.file : icon.cube);
   view.innerHTML = `
   <section class="page" aria-labelledby="ex-h">
@@ -669,20 +812,24 @@ function renderExport() {
         <a class="pill pill-sm" href="/api/cases/${id}/files/${encodeURIComponent(f.name)}" download aria-label="Download ${esc(f.name)}">${icon.download}<span>Download</span></a></div>`).join("")}
     </div>
     <div class="grid g3" style="margin-bottom:20px">
-      <div class="card steps4"><span class="n">01</span><h3>Open Slicer</h3><p>Use <b>File → Add Data</b> or drag <span class="mono">femur_estimate.stl</span> into the window. It loads as a model node.</p></div>
+      ${net ? `<div class="card steps4"><span class="n">01</span><h3>Open Slicer</h3><p>Unzip the bundle and run <span class="mono">Slicer --python-script BoneVisionLoader.py</span> in that folder, or use <b>File → Add Data</b> on <span class="mono">femur_reconstruction.stl</span> (tick LabelMap for the NRRD).</p></div>
+      <div class="card steps4"><span class="n">02</span><h3>Know the frame</h3><p>Femur landmark frame in millimetres, always a left femur, tagged as RAS so Slicer loads it unchanged. It is not registered to the patient.</p></div>
+      <div class="card steps4"><span class="n">03</span><h3>Keep the report</h3><p><span class="mono">reconstruction.json</span> records the inputs, checkpoint, per-view agreement, warnings and limitations for this estimate.</p></div>`
+      : `<div class="card steps4"><span class="n">01</span><h3>Open Slicer</h3><p>Use <b>File → Add Data</b> or drag <span class="mono">femur_estimate.stl</span> into the window. It loads as a model node.</p></div>
       <div class="card steps4"><span class="n">02</span><h3>Know the frame</h3><p>Coordinates are the shape model's canonical frame in millimetres, not patient RAS/LPS. Slicer will not align it to a CT by itself.</p></div>
-      <div class="card steps4"><span class="n">03</span><h3>Keep the report</h3><p><span class="mono">report.json</span> records the input hash, model hash, settings, metrics, warnings and limitations for this estimate.</p></div>
+      <div class="card steps4"><span class="n">03</span><h3>Keep the report</h3><p><span class="mono">report.json</span> records the input hash, model hash, settings, metrics, warnings and limitations for this estimate.</p></div>`}
     </div>
     <div class="grid g2">
       <div class="card"><div class="card-title"><h3>Coordinate frame</h3></div><dl class="kv">
         <dt>Units</dt><dd>millimetres</dd><dt>Origin</dt><dd>femoral-head landmark</dd><dt>+X</dt><dd>long axis (distal negative)</dd><dt>+Y</dt><dd>toward greater trochanter</dd><dt>Z</dt><dd>X × Y</dd>
-        <dt>Pose applied</dt><dd>fitted in-plane scale/shift</dd><dt>Patient space</dt><dd>not registered</dd></dl>
+        ${net ? "<dt>Side</dt><dd>left femur (right legs mirrored)</dd><dt>Length</dt><dd>training mean</dd>" : "<dt>Pose applied</dt><dd>fitted in-plane scale/shift</dd>"}<dt>Patient space</dt><dd>not registered</dd></dl>
         <p class="tiny faint" style="margin:12px 0 0">Mesh dimensions ${r.dimensions_mm.map((d) => fmt(d, 1)).join(" × ")} mm · ${r.mesh.vertices.toLocaleString()} vertices · ${r.mesh.faces.toLocaleString()} faces.</p></div>
-      <div class="card"><div class="card-title"><h3>Report preview</h3><a class="link-btn" href="/api/cases/${id}/files/report.json?inline=1" target="_blank" rel="noopener">Open raw</a></div><div class="code-block" id="report-pre">Loading…</div></div>
+      <div class="card"><div class="card-title"><h3>Report preview</h3><a class="link-btn" href="/api/cases/${id}/files/${r.report_file}?inline=1" target="_blank" rel="noopener">Open raw</a></div><div class="code-block" id="report-pre">Loading…</div></div>
     </div>
   </section>`;
-  api(`/api/cases/${id}/files/report.json?inline=1`).then((rep) => {
-    const trimmed = { ...rep, optimization_loss_history: `[${rep.optimization_loss_history.length} values]`, shape_coefficients_z: `[${rep.shape_coefficients_z.length} values]` };
+  api(`/api/cases/${id}/files/${r.report_file}?inline=1`).then((rep) => {
+    const trimmed = { ...rep };
+    for (const k of ["optimization_loss_history", "shape_coefficients_z"]) if (Array.isArray(rep[k])) trimmed[k] = `[${rep[k].length} values]`;
     const el = $("#report-pre");
     if (el) el.textContent = JSON.stringify(trimmed, null, 2);
   }).catch((err) => { const el = $("#report-pre"); if (el) el.textContent = err.message; });
@@ -694,7 +841,11 @@ function renderMethod() {
   view.innerHTML = `
   <section class="page" aria-labelledby="me-h">
     <header class="page-head"><div><div class="eyebrow">05 · Method</div><h1 class="h2" id="me-h">How the estimate is made, <em>and where it stops.</em></h1></div>
-      <p class="muted small">BoneVision is a research prototype. It fits a statistical shape model to a 2D outline; it does not see depth.</p></header>
+      <p class="muted small">BoneVision is a research prototype with two methods: a network trained on simulated X-rays, and a statistical shape model fitted to one outline. Neither has been validated on real radiographs.</p></header>
+    <div class="card" style="margin-bottom:20px"><div class="card-title"><h3>Learned network</h3><span class="chip" data-tone="info">AP + optional lateral</span></div>
+      <p class="small muted" style="margin-top:0">A 2D encoder per view, back-projection into a 3D grid and a 3D decoder, trained on simulated X-rays (DRRs) of 101 HFValid CT femurs with right legs mirrored onto the left. For an upload, each view is traced, placed on the training grid (long axis matched to the mean femur, head at the grid's origin, length scaled to the training mean) in four orientations, and the best-matching placement is fed to the network once.</p>
+      <div id="net-evidence"><p class="muted small">Loading…</p></div></div>
+    <div class="eyebrow muted" style="margin:0 0 10px">Shape-model fit (one AP view)</div>
     <div class="grid g4 steps4" style="margin-bottom:20px">
       <div class="card"><span class="n">01</span><h3>Trace</h3><p>Otsu thresholding, morphology and an elongation/area score choose one bone-like region in the framed image.</p></div>
       <div class="card"><span class="n">02</span><h3>Standardize</h3><p>The outline is rotated to its long axis and converted to the model's millimetre grid, sized to the population mean unless DICOM spacing is used.</p></div>
@@ -716,6 +867,11 @@ function renderMethod() {
       <li><b>VSD lower-extremity meshes</b> (CC BY-NC-SA 4.0): 60 femur meshes; not in the model until they are registered and evaluated.</li></ul></div>
   </section>`;
   api("/api/evaluation").then((ev) => {
+    const net = ev.network, ne = $("#net-evidence");
+    if (net && ne) ne.innerHTML = `<p class="small muted" style="margin:0 0 10px">${esc(net.protocol)} <span class="faint">Source: ${esc(net.source)}.</span></p>
+      <table class="data"><thead><tr>${net.columns.map((c, i) => `<th class="${i ? "num" : ""}">${esc(c)}</th>`).join("")}</tr></thead><tbody>
+      ${net.rows.map((row) => `<tr>${row.map((c, i) => `<td class="${i ? "num" : ""}">${esc(c)}</td>`).join("")}</tr>`).join("")}</tbody></table>
+      ${alerts([{ level: "warn", message: net.caveat }])}`;
     const rep = ev.reported;
     const el = $("#evidence");
     if (!el) return;
