@@ -196,6 +196,18 @@ def main():
     train_loader = torch.utils.data.DataLoader(train, batch_size=args.batch_size, shuffle=True, drop_last=True)
     val_loader = torch.utils.data.DataLoader(val, batch_size=1)
 
+    # Mean training silhouettes on the full grid; the app uses them to place
+    # an uploaded X-ray on the grid (scripts/multiview_net_backend.py).
+    occ_sum, lengths = None, []
+    for path in files["train"]:
+        occ = np.load(path)["occ"].astype(np.float32)
+        occ_sum = occ if occ_sum is None else occ_sum + occ
+        rows = np.flatnonzero(occ.any(axis=(1, 2)))
+        lengths.append((rows[-1] - rows[0]) * grid_spacing()[0])
+    mean_occ = occ_sum / len(files["train"]) >= 0.5
+    reference = {"ap": torch.from_numpy(mean_occ.any(axis=2)), "lat": torch.from_numpy(mean_occ.any(axis=1)),
+                 "length_mm": float(np.mean(lengths))}
+
     model = MultiViewFemurNet(views=views).to(device)
     print("Parameters: {:.2f} M".format(sum(p.numel() for p in model.parameters()) / 1e6))
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
@@ -225,7 +237,7 @@ def main():
                 row[2], row[3] = round(s["dice"], 4), round(s.get("mean_surface_mm", float("nan")), 3)
                 if s["dice"] > best:
                     best = s["dice"]
-                    torch.save({"model": model.state_dict(), "epoch": epoch, "val": s,
+                    torch.save({"model": model.state_dict(), "epoch": epoch, "val": s, "reference": reference,
                                 "config": {"views": views, "downsample": args.downsample}}, ckpt_path)
                 print("epoch {:4d}  loss {:.4f}  val dice {:.4f}  surface {} mm{}".format(
                     epoch, row[1], s["dice"], row[3], "  *saved" if s["dice"] >= best else ""))

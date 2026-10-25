@@ -24,10 +24,70 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 from scipy import ndimage as ndi
-from skimage.measure import marching_cubes
+from skimage.measure import label, marching_cubes, regionprops
 
-from reconstruct_single_xray import BOUNDS_DEFAULT, MODEL_PATH, read_image, segment_single_bone, standardize_mask
+from reconstruct_single_xray import BOUNDS_DEFAULT, MODEL_PATH, read_image, segment_single_bone
 from slicer_export import FRAME_DESCRIPTION, LABELMAP_NAME, MESH_NAME, export_for_slicer
+
+
+# The multi-view SSM fit keeps the original placement (bounding-box scaling with an
+# optional shared length), which differs from the single-view pipeline's affine map.
+def standardize_mask(mask: np.ndarray, output_shape: tuple[int, int], reference_mask: np.ndarray | None = None, match_length: bool = False) -> np.ndarray:
+    """Orient one isolated femur and place it in the SSM's canonical AP frame.
+
+    Absolute scale and translation are absent from ordinary PNG/JPEG images,
+    so length and center are normalized to the mean SSM projection. Relative
+    silhouette proportions are preserved as much as the projection bounds allow.
+    With match_length the bone length alone sets the scale (bounded by the
+    canvas), so views of one femur share a scale and keep their widths.
+    """
+    coords = np.argwhere(mask)
+    if len(coords) < 100:
+        raise ValueError("The detected bone mask is too small to fit the shape model.")
+    props0 = regionprops(label(mask.astype(np.uint8)))
+    orientation = math.degrees(float(props0[0].orientation)) if props0 else 0.0
+    from skimage.transform import rotate
+    alternatives = []
+    for angle in (-orientation, orientation):
+        rotated_try = rotate(mask.astype(np.float32), angle=angle, resize=True, order=0, preserve_range=True) > 0.5
+        props = regionprops(label(rotated_try))
+        alignment_error = abs(float(props[0].orientation)) if props else float("inf")
+        alternatives.append((alignment_error, rotated_try))
+    rotated = min(alternatives, key=lambda item: item[0])[1]
+    rr, cc = np.where(rotated)
+    cropped = rotated[rr.min():rr.max()+1, cc.min():cc.max()+1]
+    if cropped.shape[0] < cropped.shape[1]:
+        cropped = cropped.T
+    out_h, out_w = output_shape
+    if reference_mask is not None:
+        ry, rx = np.where(reference_mask)
+        if len(ry):
+            ref_h = int(ry.max() - ry.min() + 1)
+            ref_w = int(rx.max() - rx.min() + 1)
+            center_y, center_x = float(np.mean(ry)), float(np.mean(rx))
+        else:
+            ref_h, ref_w = out_h, out_w
+            center_y, center_x = (out_h - 1) / 2, (out_w - 1) / 2
+    else:
+        ref_h, ref_w = out_h, out_w
+        center_y, center_x = (out_h - 1) / 2, (out_w - 1) / 2
+    if match_length:
+        scale = min(ref_h / cropped.shape[0], out_w / cropped.shape[1])
+    else:
+        scale = min(ref_h / cropped.shape[0], ref_w / cropped.shape[1])
+    new_h = max(1, min(out_h, int(round(cropped.shape[0] * scale))))
+    new_w = max(1, min(out_w, int(round(cropped.shape[1] * scale))))
+    resized = np.asarray(Image.fromarray(cropped.astype(np.uint8) * 255).resize((new_w, new_h), Image.Resampling.NEAREST)) > 0
+    canvas = np.zeros(output_shape, dtype=bool)
+    y0 = int(round(center_y - (new_h - 1) / 2))
+    x0 = int(round(center_x - (new_w - 1) / 2))
+    sy0, sx0 = max(0, -y0), max(0, -x0)
+    dy0, dx0 = max(0, y0), max(0, x0)
+    hcopy = min(new_h - sy0, out_h - dy0)
+    wcopy = min(new_w - sx0, out_w - dx0)
+    if hcopy > 0 and wcopy > 0:
+        canvas[dy0:dy0+hcopy, dx0:dx0+wcopy] = resized[sy0:sy0+hcopy, sx0:sx0+wcopy]
+    return canvas
 
 MAX_VIEWS = 6
 VIEW_PRESETS = {"AP": 0.0, "lateral": 90.0}
