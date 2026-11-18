@@ -10,7 +10,7 @@
 
 > **Standing rule (from the user):** update this file after EVERY step, started or finished, so a fresh chat can resume exactly where this one stopped. Keep "Step log" and "Remaining steps" current.
 
-Last updated: 2026-11-18 15:30 IST
+Last updated: 2026-11-18 15:40 IST
 Repo (local): `/home/claude/work/repo`, branch `ui-overhaul`
 Remote: https://github.com/dhanushiya-17/X-Ray-3-d-Regeneration-YOLO (push works as of 2026-11-18; branch `ui-overhaul` is on origin)
 
@@ -57,6 +57,7 @@ Redesign the frontend, improve the 3D femur results, and build a proper backend,
 - [x] 2026-11-18: committed `e8e6e83` and pushed `ui-overhaul` to origin successfully.
 
 - [x] 2026-11-18 15:30: user asked "what should I do first, the website runs on localhost, check the repo first". Fetched origin, found main far ahead (see READ FIRST). Re-planned: Docker/K8s track against main's `serve.py`. Nothing built on this branch beyond the handoff.
+- [x] 2026-11-18 15:40: user says she is a COMPLETE beginner at Docker and wants to learn from scratch. Teaching mode: mental model first (image vs container, Dockerfile, layers, ports, volumes), then tiny hands-on steps; she runs commands on her own machine (Windows + WSL Ubuntu 24.04, Docker Desktop with WSL2 backend) and pastes output; Claude explains. Lesson 1 given: install Docker Desktop, `docker run hello-world`, `docker run -d -p 8080:80 nginx`, `docker ps`, `docker logs`, `docker stop`. Waiting for her output.
 
 ## Docker/K8s learning track (added 2026-11-18, runs AFTER the app works)
 User wants to learn Docker and Kubernetes through this project. She prefers to write things herself first and get reasoning explained, so deliver this as `LEARN-DEVOPS.md` with staged exercises and acceptance checks, and review her Dockerfiles rather than handing finished ones over.
@@ -84,3 +85,10 @@ User wants to learn Docker and Kubernetes through this project. She prefers to w
 3. [ ] Claude reviews her Dockerfile and explains each decision; then `.dockerignore`, non-root user, HEALTHCHECK on `/api/status`, layer caching.
 4. [ ] Then Compose, then Kubernetes on kind. Key K8s lesson specific to this app: uploads and cases live in the server process memory (`MAX_UPLOADS=8`), so more than 1 replica breaks sessions; use 1 replica first, then discuss sticky sessions or moving state to Redis.
 5. [ ] Separate, later: restyle `web/` with the Linear tokens listed under Decisions (user's original UI request), on a branch off main.
+
+## Docker lesson ladder (beginner, one lesson per message, wait for her output before the next)
+1. [ ] Lesson 1: install Docker Desktop (WSL2), `hello-world`, run nginx with `-p`, `ps`, `logs`, `stop`, `rm`.
+2. [ ] Lesson 2: images vs containers, `docker images`, `docker pull python:3.11-slim`, `docker run -it python:3.11-slim python` (poke inside, show it is isolated), `docker exec`.
+3. [ ] Lesson 3: write a tiny Dockerfile for a 5-line Python script, `docker build -t`, `docker run`; layers and cache (change a line, rebuild, watch what is reused).
+4. [ ] Lesson 4: ports and `0.0.0.0` vs `127.0.0.1` using a tiny FastAPI hello app; then volumes (`-v`) with a file she edits on the host.
+5. [ ] Lesson 5: BoneVision's first Dockerfile (her own attempt), `.dockerignore`, review. Then Compose, then Kubernetes.
