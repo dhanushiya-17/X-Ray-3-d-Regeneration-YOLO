@@ -1,8 +1,16 @@
 # HANDOFF: BoneVision UI + 3D overhaul
 
+> **READ FIRST (2026-11-18 15:30 IST): THE PLAN BELOW IS PARTLY SUPERSEDED.**
+> `origin/main` moved far ahead of this branch's base (`010e0bc`). Main (as of 2026-10-25) already has: `serve.py` + FastAPI `bonevision/server.py`, a vanilla-JS frontend in `web/` (three.js, fonts and libs vendored, works offline, NO node build step), a trained multi-view network (AP+lateral test Dice 0.943, 0.95 mm mean surface distance; AP-only Dice 0.865), `--demo` mode with synthetic nets, STL/NRRD/OBJ/Slicer exports, multi-view averaging (up to 3 AP + 3 lateral), YOLO fracture script on `feature/fracture-detect-threshold`, CI in `.github/workflows/tests.yml`, and its own `docs/HANDOFF.md` + `docs/HANDOFF_COMPACT.md` (read those: they are the project's source of truth).
+> Consequences:
+> - Branch `ui-overhaul` is STALE. Do not build on it or merge it. Its only content is the `app.py` move and this file. Start new work from a fresh branch off latest `origin/main` (generic contextual name, e.g. `feature/docker-k8s`, `feature/web-ui-redesign`; no session ids).
+> - The React/Vite/Node rewrite, the new `bonevision/` core library, the synthetic femur SSM generator and the new FastAPI `server/` described below are NOT needed: they would duplicate main. Idea worth porting later, on top of main: mesh smoothing (Taubin), per-vertex uncertainty map (main's plan B4), clipping/measurement tools, Linear-style restyle of `web/css/app.css`.
+> - Docker/K8s track is now the immediate focus (see that section), built against main's `serve.py`.
+> - Other people have merged work into main (PRs #1-#7) and several feature branches exist, so branch from the latest main and keep changes small.
+
 > **Standing rule (from the user):** update this file after EVERY step, started or finished, so a fresh chat can resume exactly where this one stopped. Keep "Step log" and "Remaining steps" current.
 
-Last updated: 2026-11-18 13:20 IST
+Last updated: 2026-11-18 15:30 IST
 Repo (local): `/home/claude/work/repo`, branch `ui-overhaul`
 Remote: https://github.com/dhanushiya-17/X-Ray-3-d-Regeneration-YOLO (push works as of 2026-11-18; branch `ui-overhaul` is on origin)
 
@@ -48,6 +56,8 @@ Redesign the frontend, improve the 3D femur results, and build a proper backend,
 
 - [x] 2026-11-18: committed `e8e6e83` and pushed `ui-overhaul` to origin successfully.
 
+- [x] 2026-11-18 15:30: user asked "what should I do first, the website runs on localhost, check the repo first". Fetched origin, found main far ahead (see READ FIRST). Re-planned: Docker/K8s track against main's `serve.py`. Nothing built on this branch beyond the handoff.
+
 ## Docker/K8s learning track (added 2026-11-18, runs AFTER the app works)
 User wants to learn Docker and Kubernetes through this project. She prefers to write things herself first and get reasoning explained, so deliver this as `LEARN-DEVOPS.md` with staged exercises and acceptance checks, and review her Dockerfiles rather than handing finished ones over.
 - Stage 1, Docker: multi-stage build (node builds the frontend, python serves it), `.dockerignore`, CPU vs CUDA base image, non-root user, HEALTHCHECK, `models/` as a mounted volume (large and gitignored, never baked into the image), env-based config, layer caching.
@@ -67,3 +77,10 @@ User wants to learn Docker and Kubernetes through this project. She prefers to w
 6. [ ] Update `README.md` (run instructions, honesty notes), `requirements`, `run.sh`.
 7. [ ] Independent review by a separate agent, then zip/patch for the user.
 8. [ ] Docker/K8s learning track: write `LEARN-DEVOPS.md` (stages above), then review the user's own Dockerfile/manifests as she writes them.
+
+## Revised next steps (2026-11-18, supersede "Remaining steps" above)
+1. [ ] User runs the app locally from latest main and confirms the baseline: `python serve.py --demo` (no models needed) then open http://127.0.0.1:8000 and check `GET /api/status`. This is the acceptance test for the container.
+2. [ ] User writes her FIRST Dockerfile (CPU, `python:3.11-slim` to match CI, torch from the CPU index, `pip install -r requirements-app.txt`). Goal: `docker run -p 8000:8000 <image> ...` shows the same page. Lessons to discover: `serve.py` defaults to host 127.0.0.1 so the container must be started with `--host 0.0.0.0`; models (`models/*.pt`, `*.npz`) are gitignored and big, so mount them as a volume, never bake them in; `--demo` trains synthetic nets on first start (slow, do it at build time or in a volume).
+3. [ ] Claude reviews her Dockerfile and explains each decision; then `.dockerignore`, non-root user, HEALTHCHECK on `/api/status`, layer caching.
+4. [ ] Then Compose, then Kubernetes on kind. Key K8s lesson specific to this app: uploads and cases live in the server process memory (`MAX_UPLOADS=8`), so more than 1 replica breaks sessions; use 1 replica first, then discuss sticky sessions or moving state to Redis.
+5. [ ] Separate, later: restyle `web/` with the Linear tokens listed under Decisions (user's original UI request), on a branch off main.
