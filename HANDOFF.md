@@ -4,7 +4,7 @@
 
 Last updated: 2026-11-18 13:20 IST
 Repo (local): `/home/claude/work/repo`, branch `ui-overhaul`
-Remote: https://github.com/dhanushiya-17/X-Ray-3-d-Regeneration-YOLO (push currently FAILS with 403, see Blockers)
+Remote: https://github.com/dhanushiya-17/X-Ray-3-d-Regeneration-YOLO (push works as of 2026-11-18; branch `ui-overhaul` is on origin)
 
 ## Goal
 Redesign the frontend, improve the 3D femur results, and build a proper backend, so the project can be shown to faculty. Design reference: VoltAgent/awesome-design-md (cloned at `/home/claude/work/designmd`, Linear spec at `src/design-md/linear.app/DESIGN.md`).
@@ -37,7 +37,7 @@ Redesign the frontend, improve the 3D femur results, and build a proper backend,
 6. **Delivery:** push is blocked, so the final handover is a zip/patch of the repo changes.
 
 ## Blockers
-- `git push` returns 403: Claude has no GitHub access to the repo. Fix: install the Claude GitHub App at https://github.com/apps/claude/installations/select_target, or reconnect GitHub in claude.ai Settings, Connectors.
+- None. (Earlier `git push` 403 resolved on 2026-11-18; GitHub access now works.) Item 6 under Decisions (zip/patch delivery) is now only a fallback.
 
 ## Step log (newest last)
 - [x] Cloned the repo and design-md collection; read the core code, README and Linear DESIGN.md.
@@ -45,6 +45,8 @@ Redesign the frontend, improve the 3D femur results, and build a proper backend,
 - [x] Wrote the first HANDOFF.md and committed it as `e55e7ae` (local only, push failed with 403).
 - [x] Restructured HANDOFF.md into a running log (this version).
 - [x] 2026-11-18: user asked if she can learn Docker and Kubernetes through this project. Answer: yes. Decision: finish the app first (core, server, frontend), THEN add a containerization track (see "Docker/K8s learning track" below). State at this point: `bonevision/`, `server/`, `frontend/` are still empty; no core code written yet. Sandbox has the `docker` CLI only (daemon untested); no kubectl/kind.
+
+- [x] 2026-11-18: committed `e8e6e83` and pushed `ui-overhaul` to origin successfully.
 
 ## Docker/K8s learning track (added 2026-11-18, runs AFTER the app works)
 User wants to learn Docker and Kubernetes through this project. She prefers to write things herself first and get reasoning explained, so deliver this as `LEARN-DEVOPS.md` with staged exercises and acceptance checks, and review her Dockerfiles rather than handing finished ones over.
